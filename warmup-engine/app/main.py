@@ -1,14 +1,188 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
 import random
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, create_engine, func, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
-app = FastAPI(title="Warmup Engine", version="1.0.0")
+try:
+    import dns.resolver
+except Exception:  # pragma: no cover - optional runtime capability
+    dns = None
+else:  # pragma: no cover
+    dns = dns.resolver
 
-jobs: Dict[str, dict] = {}
+try:
+    from redis import Redis
+    from rq import Queue, SimpleWorker
+except Exception:  # pragma: no cover - optional runtime capability
+    Redis = None
+    Queue = None
+    SimpleWorker = None
+
+app = FastAPI(title="Warmup Engine", version="2.0.0")
+
+DATABASE_URL = os.getenv("WARMUP_DATABASE_URL", "sqlite+pysqlite:///./warmup.db")
+EWMA_ALPHA = float(os.getenv("WARMUP_EWMA_ALPHA", "0.35"))
+MAX_MAILBOX_DAILY_CAP = int(os.getenv("MAX_MAILBOX_DAILY_CAP", "250"))
+MAX_TENANT_DAILY_CAP = int(os.getenv("MAX_TENANT_DAILY_CAP", "5000"))
+REDIS_URL = os.getenv("REDIS_URL", "")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+logger = logging.getLogger("warmup-engine")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
+
+METRICS: dict[str, int] = defaultdict(int)
+IN_MEMORY_QUEUES: dict[str, deque] = defaultdict(deque)
+DEAD_LETTER_QUEUE: deque = deque(maxlen=1000)
+GLOBAL_KILL_SWITCH = False
+TENANT_KILL_SWITCHES: set[str] = set()
+PROVIDER_KILL_SWITCHES: set[str] = set()
+
+QUEUE_NAMES = {"schedule_generation", "send_execution", "reply_simulation", "reputation_scoring"}
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class MailboxProfile(Base):
+    __tablename__ = "mailbox_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
+    domain_age_days: Mapped[int] = mapped_column(Integer, default=0)
+
+    inbox_ewma: Mapped[float] = mapped_column(Float, default=0.72)
+    spam_ewma: Mapped[float] = mapped_column(Float, default=0.07)
+    bounce_ewma: Mapped[float] = mapped_column(Float, default=0.03)
+    complaint_ewma: Mapped[float] = mapped_column(Float, default=0.004)
+    reply_ewma: Mapped[float] = mapped_column(Float, default=0.16)
+
+    reputation_score: Mapped[float] = mapped_column(Float, default=0.65)
+    risk_score: Mapped[float] = mapped_column(Float, default=0.2)
+    mode: Mapped[str] = mapped_column(String(32), default="normal")
+    current_daily_target: Mapped[int] = mapped_column(Integer, default=10)
+
+    pid_integral: Mapped[float] = mapped_column(Float, default=0.0)
+    pid_prev_error: Mapped[float] = mapped_column(Float, default=0.0)
+    stable_windows: Mapped[int] = mapped_column(Integer, default=0)
+    blacklisted: Mapped[bool] = mapped_column(Boolean, default=False)
+    partner_histogram: Mapped[str] = mapped_column(String, default="{}")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_mailbox_profiles_tenant_mailbox", "tenant_id", "mailbox", unique=True),
+    )
+
+
+class WarmupJob(Base):
+    __tablename__ = "warmup_jobs"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    daily_target: Mapped[int] = mapped_column(Integer)
+    interval_minutes: Mapped[int] = mapped_column(Integer)
+    reply_simulation_rate: Mapped[float] = mapped_column(Float)
+    spam_rescue_rate: Mapped[float] = mapped_column(Float)
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_warmup_jobs_tenant_mailbox", "tenant_id", "mailbox"),
+    )
+
+
+class WarmupEvent(Base):
+    __tablename__ = "warmup_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    event_type: Mapped[str] = mapped_column(String(64))
+    outcome: Mapped[str] = mapped_column(String(64), default="accepted")
+    queue_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), unique=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued")
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    month_bucket: Mapped[str] = mapped_column(String(7), default=lambda: datetime.now(timezone.utc).strftime("%Y-%m"))
+    payload: Mapped[str] = mapped_column(String, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_warmup_events_tenant_mailbox", "tenant_id", "mailbox"),
+        Index("ix_warmup_events_month_bucket", "month_bucket"),
+    )
+
+
+class DeliverabilitySnapshot(Base):
+    __tablename__ = "deliverability_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    domain: Mapped[str] = mapped_column(String(255), index=True)
+    spf_aligned: Mapped[bool] = mapped_column(Boolean, default=False)
+    dkim_aligned: Mapped[bool] = mapped_column(Boolean, default=False)
+    dmarc_aligned: Mapped[bool] = mapped_column(Boolean, default=False)
+    ptr_valid: Mapped[bool] = mapped_column(Boolean, default=False)
+    tls_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    inbox_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    promotions_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    spam_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_deliverability_snapshots_tenant_mailbox", "tenant_id", "mailbox"),
+    )
+
+
+class RiskSignal(Base):
+    __tablename__ = "risk_signals"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    signal_type: Mapped[str] = mapped_column(String(64))
+    severity: Mapped[float] = mapped_column(Float)
+    details: Mapped[str] = mapped_column(String, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_risk_signals_tenant_mailbox", "tenant_id", "mailbox"),
+    )
+
+
+Base.metadata.create_all(engine)
 
 
 class WarmupJobRequest(BaseModel):
@@ -16,40 +190,852 @@ class WarmupJobRequest(BaseModel):
     mailbox: str
     domain_age_days: int = Field(ge=0)
     blacklist_detected: bool = False
+    timezone: str = "UTC"
+
+
+class ReputationUpdateRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    inbox_rate: float = Field(ge=0.0, le=1.0)
+    spam_rate: float = Field(ge=0.0, le=1.0)
+    bounce_rate: float = Field(ge=0.0, le=1.0)
+    complaint_rate: float = Field(ge=0.0, le=1.0)
+    reply_rate: float = Field(ge=0.0, le=1.0)
+    blacklist_detected: bool = False
+
+
+class ScheduleRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    partner_pool: list[str] = Field(default_factory=list)
+    requested_count: int = Field(default=20, ge=1, le=250)
+
+
+class QueueTaskRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    queue_name: Literal["schedule_generation", "send_execution", "reply_simulation", "reputation_scoring"]
+    idempotency_key: str = Field(min_length=8, max_length=128)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    max_attempts: int = Field(default=4, ge=1, le=10)
+
+
+class DeliverabilityCheckRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    domain: str
+    dkim_selector: str = "default"
+    ptr_valid: bool | None = None
+    tls_supported: bool | None = None
+    inbox_pct: float = Field(default=0.7, ge=0.0, le=1.0)
+    promotions_pct: float = Field(default=0.2, ge=0.0, le=1.0)
+    spam_pct: float = Field(default=0.1, ge=0.0, le=1.0)
+
+
+class ContentPlanRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    day_number: int = Field(ge=1, le=365)
+
+
+class KillSwitchRequest(BaseModel):
+    scope: Literal["global", "tenant", "provider"]
+    enabled: bool
+    value: str | None = None
+
+
+class AbuseCheckRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    complaint_spike: bool = False
+    repeated_bad_domains: int = Field(default=0, ge=0)
+    anomalous_burstiness: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def ewma(previous: float, observed: float, alpha: float = EWMA_ALPHA) -> float:
+    return alpha * observed + (1 - alpha) * previous
+
+
+def provider_from_mailbox(mailbox: str) -> str:
+    domain = mailbox.split("@")[-1].lower()
+    return domain
+
+
+def json_log(event: str, **kwargs: Any) -> None:
+    logger.info(json.dumps({"event": event, **kwargs}, default=str))
+
+
+def base_target_from_domain_age(domain_age_days: int) -> int:
+    ramp_factor = min(1.0, max(0.1, domain_age_days / 120))
+    return int(5 + 95 * ramp_factor)
+
+
+def load_profile_histogram(profile: MailboxProfile) -> dict[str, int]:
+    try:
+        data = json.loads(profile.partner_histogram or "{}")
+        return {str(k): int(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def store_profile_histogram(profile: MailboxProfile, histogram: dict[str, int]) -> None:
+    profile.partner_histogram = json.dumps(histogram)
+
+
+def entropy_score(histogram: dict[str, int]) -> float:
+    total = sum(histogram.values())
+    if total <= 0:
+        return 1.0
+    entropy = 0.0
+    for count in histogram.values():
+        if count <= 0:
+            continue
+        p = count / total
+        entropy -= p * math.log2(p)
+    max_entropy = math.log2(max(2, len(histogram)))
+    if max_entropy == 0:
+        return 1.0
+    return clamp(entropy / max_entropy, 0.0, 1.0)
+
+
+def choose_timezone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def window_ranges_for_day(local_day: datetime) -> list[tuple[int, int]]:
+    if local_day.weekday() >= 5:  # weekend profile
+        return [(9, 11), (16, 18)]
+    return [(8, 11), (14, 18)]
+
+
+def generate_humanized_schedule(profile: MailboxProfile, partners: list[str], count: int) -> list[dict[str, Any]]:
+    tz = choose_timezone(profile.timezone)
+    local_now = utc_now().astimezone(tz)
+    ranges = window_ranges_for_day(local_now)
+    rng_seed = f"{profile.tenant_id}:{profile.mailbox}:{local_now.date().isoformat()}:{count}:{len(partners)}"
+    rng = random.Random(rng_seed)
+
+    events = []
+    for i in range(count):
+        start_h, end_h = ranges[i % len(ranges)]
+        hour = rng.randint(start_h, max(start_h, end_h - 1))
+        minute = rng.randint(0, 59)
+        offset_days = 0 if hour >= local_now.hour else 1
+
+        local_send = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=offset_days)
+        partner = partners[i % len(partners)] if partners else "seed@warmup.local"
+
+        thread_length = rng.randint(1, 4)
+        reply_delay_minutes = rng.randint(7, 240)
+        events.append(
+            {
+                "send_at": local_send.astimezone(timezone.utc).isoformat(),
+                "partner": partner,
+                "thread_length": thread_length,
+                "reply_delay_minutes": reply_delay_minutes,
+                "include_link": False,
+                "include_image": False,
+            }
+        )
+    return sorted(events, key=lambda item: item["send_at"])
+
+
+def pick_partners(profile: MailboxProfile, pool: list[str], requested_count: int) -> tuple[list[str], float]:
+    unique_pool = [mail for mail in dict.fromkeys(pool) if mail and mail.lower() != profile.mailbox.lower()]
+    if not unique_pool:
+        unique_pool = [f"seed-{i}@warmup.local" for i in range(1, 7)]
+
+    histogram = load_profile_histogram(profile)
+    selected: list[str] = []
+    last_partner = None
+
+    for _ in range(requested_count):
+        weighted: list[tuple[str, float]] = []
+        for candidate in unique_pool:
+            seen_count = histogram.get(candidate, 0)
+            weight = 1 / (1 + seen_count)
+            if candidate == last_partner:
+                weight *= 0.2  # avoid repetitive pair loops
+            weighted.append((candidate, weight))
+
+        total_weight = sum(weight for _, weight in weighted)
+        roll = random.random() * total_weight
+        upto = 0.0
+        chosen = weighted[0][0]
+        for candidate, weight in weighted:
+            upto += weight
+            if upto >= roll:
+                chosen = candidate
+                break
+
+        selected.append(chosen)
+        histogram[chosen] = histogram.get(chosen, 0) + 1
+        last_partner = chosen
+
+    score = entropy_score(histogram)
+    store_profile_histogram(profile, histogram)
+    return selected, score
+
+
+def get_or_create_profile(session: Session, tenant_id: str, mailbox: str, domain_age_days: int = 0, timezone_name: str = "UTC") -> MailboxProfile:
+    profile = session.scalar(
+        select(MailboxProfile).where(MailboxProfile.tenant_id == tenant_id, MailboxProfile.mailbox == mailbox.lower())
+    )
+    if profile:
+        return profile
+
+    profile = MailboxProfile(
+        tenant_id=tenant_id,
+        mailbox=mailbox.lower(),
+        timezone=timezone_name,
+        domain_age_days=domain_age_days,
+        current_daily_target=base_target_from_domain_age(domain_age_days),
+    )
+    session.add(profile)
+    session.flush()
+    return profile
+
+
+def aggregate_tenant_daily_target(session: Session, tenant_id: str) -> int:
+    return int(
+        session.scalar(select(func.coalesce(func.sum(WarmupJob.daily_target), 0)).where(WarmupJob.tenant_id == tenant_id))
+        or 0
+    )
+
+
+def classify_risk(profile: MailboxProfile, blacklist_detected: bool) -> float:
+    structural = 0.0
+    if blacklist_detected:
+        structural += 0.35
+    base = (
+        profile.spam_ewma * 0.34
+        + profile.bounce_ewma * 0.24
+        + profile.complaint_ewma * 0.26
+        + max(0.0, 0.18 - profile.reply_ewma) * 0.20
+    )
+    return clamp(base + structural, 0.0, 1.0)
+
+
+def quality_score(profile: MailboxProfile) -> float:
+    return clamp(
+        profile.inbox_ewma * 0.55
+        + profile.reply_ewma * 0.2
+        - profile.spam_ewma * 0.35
+        - profile.bounce_ewma * 0.25
+        - profile.complaint_ewma * 0.4,
+        0.0,
+        1.0,
+    )
+
+
+def apply_adaptive_policy(profile: MailboxProfile, risk: float, blacklist_detected: bool) -> tuple[int, str]:
+    kp, ki, kd = 0.35, 0.08, 0.18
+    quality = quality_score(profile)
+    error = quality - 0.65
+
+    profile.pid_integral = clamp(profile.pid_integral + error, -5.0, 5.0)
+    derivative = error - profile.pid_prev_error
+    profile.pid_prev_error = error
+
+    delta = kp * error + ki * profile.pid_integral + kd * derivative
+    candidate = int(round(profile.current_daily_target + (delta * 35)))
+    candidate = int(clamp(candidate, 1, MAX_MAILBOX_DAILY_CAP))
+
+    mode = profile.mode
+    if blacklist_detected or risk >= 0.6:
+        mode = "quarantine"
+        candidate = min(candidate, 5)
+        profile.stable_windows = 0
+    elif risk >= 0.4:
+        mode = "throttle"
+        candidate = min(candidate, max(10, int(profile.current_daily_target * 0.7)))
+        profile.stable_windows = 0
+    elif risk <= 0.17 and profile.mode in {"quarantine", "rescue", "throttle"}:
+        profile.stable_windows += 1
+        if profile.stable_windows >= 3:
+            mode = "normal"
+        else:
+            mode = "rescue"
+            candidate = max(candidate, 8)
+    else:
+        if mode in {"quarantine", "rescue", "throttle"} and risk < 0.25:
+            mode = "rescue"
+        elif risk < 0.25:
+            mode = "normal"
+
+    return candidate, mode
+
+
+def is_killed(tenant_id: str, mailbox: str) -> bool:
+    if GLOBAL_KILL_SWITCH:
+        return True
+    if tenant_id in TENANT_KILL_SWITCHES:
+        return True
+    provider = provider_from_mailbox(mailbox)
+    return provider in PROVIDER_KILL_SWITCHES
+
+
+def maybe_resolve_dns_txt(name: str) -> str:
+    if dns is None:
+        return ""
+    try:
+        answers = dns.resolve(name, "TXT")
+        return " ".join(str(r).strip('"') for r in answers)
+    except Exception:
+        return ""
+
+
+def execute_queue_task(payload: dict[str, Any]) -> dict[str, Any]:
+    queue_name = payload.get("queue_name", "")
+    if queue_name not in QUEUE_NAMES:
+        raise ValueError("unsupported queue")
+
+    if payload.get("force_fail"):
+        raise RuntimeError("forced failure")
+
+    return {"status": "processed", "queue": queue_name, "processed_at": utc_now().isoformat()}
+
+
+def get_rq_queue(queue_name: str):
+    if not (REDIS_URL and Redis and Queue):
+        return None
+    conn = Redis.from_url(REDIS_URL)
+    return Queue(queue_name, connection=conn)
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "warmup-engine"}
+    return {
+        "status": "ok",
+        "service": "warmup-engine",
+        "redis_enabled": bool(REDIS_URL and Redis and Queue),
+        "queues": sorted(QUEUE_NAMES),
+    }
+
+
+@app.get("/metrics")
+def metrics() -> dict:
+    return {"counters": dict(METRICS), "dead_letter_queue_size": len(DEAD_LETTER_QUEUE)}
 
 
 @app.post("/warmup/jobs")
 def create_job(payload: WarmupJobRequest) -> dict:
-    ramp_factor = min(1.0, max(0.1, payload.domain_age_days / 120))
-    base_daily = int(5 + 95 * ramp_factor)
-    if payload.blacklist_detected:
-        base_daily = max(1, int(base_daily * 0.25))
+    mailbox = payload.mailbox.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(
+            session,
+            tenant_id=payload.tenant_id,
+            mailbox=mailbox,
+            domain_age_days=payload.domain_age_days,
+            timezone_name=payload.timezone,
+        )
 
-    interval_minutes = random.randint(8, 55)
-    reply_simulation_rate = round(random.uniform(0.18, 0.42), 2)
-    spam_rescue_rate = round(random.uniform(0.03, 0.11), 2)
+        if is_killed(payload.tenant_id, mailbox):
+            profile.mode = "paused"
+            session.commit()
+            raise HTTPException(status_code=423, detail="Kill switch active for mailbox/tenant/provider")
 
-    job_id = f"warmup-{uuid.uuid4().hex[:12]}"
-    next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
-    jobs[job_id] = {
-        "job_id": job_id,
-        "tenant_id": payload.tenant_id,
-        "mailbox": payload.mailbox,
-        "daily_target": base_daily,
-        "interval_minutes": interval_minutes,
-        "reply_simulation_rate": reply_simulation_rate,
-        "spam_rescue_rate": spam_rescue_rate,
-        "blacklist_detected": payload.blacklist_detected,
-        "next_run_at": next_run.isoformat(),
-    }
-    return jobs[job_id]
+        base_daily = base_target_from_domain_age(payload.domain_age_days)
+        if payload.blacklist_detected:
+            base_daily = max(1, int(base_daily * 0.25))
+            profile.blacklisted = True
+            profile.mode = "quarantine"
+
+        tenant_total = aggregate_tenant_daily_target(session, payload.tenant_id)
+        if tenant_total + base_daily > MAX_TENANT_DAILY_CAP:
+            raise HTTPException(status_code=429, detail="Tenant warmup cap exceeded")
+
+        interval_minutes = random.randint(8, 55)
+        reply_simulation_rate = round(random.uniform(0.18, 0.42), 2)
+        spam_rescue_rate = round(random.uniform(0.03, 0.11), 2)
+
+        job_id = f"warmup-{uuid.uuid4().hex[:12]}"
+        next_run = utc_now() + timedelta(minutes=interval_minutes)
+
+        profile.current_daily_target = int(clamp(base_daily, 1, MAX_MAILBOX_DAILY_CAP))
+        profile.updated_at = utc_now()
+
+        job = WarmupJob(
+            job_id=job_id,
+            tenant_id=payload.tenant_id,
+            mailbox=mailbox,
+            status="active" if profile.mode != "paused" else "paused",
+            daily_target=profile.current_daily_target,
+            interval_minutes=interval_minutes,
+            reply_simulation_rate=reply_simulation_rate,
+            spam_rescue_rate=spam_rescue_rate,
+            next_run_at=next_run,
+        )
+        session.add(job)
+        session.commit()
+
+        METRICS["jobs_created"] += 1
+        json_log("warmup_job_created", tenant_id=payload.tenant_id, mailbox=mailbox, job_id=job_id)
+        return {
+            "job_id": job_id,
+            "tenant_id": payload.tenant_id,
+            "mailbox": mailbox,
+            "daily_target": job.daily_target,
+            "interval_minutes": interval_minutes,
+            "reply_simulation_rate": reply_simulation_rate,
+            "spam_rescue_rate": spam_rescue_rate,
+            "blacklist_detected": payload.blacklist_detected,
+            "mode": profile.mode,
+            "next_run_at": next_run.isoformat(),
+        }
 
 
 @app.get("/warmup/jobs")
-def list_jobs() -> dict:
-    return {"items": list(jobs.values())}
+def list_jobs(tenant_id: str | None = None, mailbox: str | None = None) -> dict:
+    with Session(engine) as session:
+        stmt = select(WarmupJob)
+        if tenant_id:
+            stmt = stmt.where(WarmupJob.tenant_id == tenant_id)
+        if mailbox:
+            stmt = stmt.where(WarmupJob.mailbox == mailbox.lower())
+        rows = list(session.scalars(stmt.order_by(WarmupJob.created_at.desc()).limit(500)))
+        return {
+            "items": [
+                {
+                    "job_id": row.job_id,
+                    "tenant_id": row.tenant_id,
+                    "mailbox": row.mailbox,
+                    "status": row.status,
+                    "daily_target": row.daily_target,
+                    "interval_minutes": row.interval_minutes,
+                    "next_run_at": row.next_run_at.isoformat(),
+                }
+                for row in rows
+            ]
+        }
+
+
+@app.post("/warmup/reputation/score")
+def update_reputation(payload: ReputationUpdateRequest) -> dict:
+    mailbox = payload.mailbox.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+
+        profile.inbox_ewma = ewma(profile.inbox_ewma, payload.inbox_rate)
+        profile.spam_ewma = ewma(profile.spam_ewma, payload.spam_rate)
+        profile.bounce_ewma = ewma(profile.bounce_ewma, payload.bounce_rate)
+        profile.complaint_ewma = ewma(profile.complaint_ewma, payload.complaint_rate)
+        profile.reply_ewma = ewma(profile.reply_ewma, payload.reply_rate)
+        profile.blacklisted = payload.blacklist_detected
+
+        risk = classify_risk(profile, payload.blacklist_detected)
+        profile.risk_score = risk
+        profile.reputation_score = clamp(1 - risk, 0.0, 1.0)
+
+        new_target, mode = apply_adaptive_policy(profile, risk, payload.blacklist_detected)
+        if is_killed(payload.tenant_id, mailbox):
+            mode = "paused"
+            new_target = 0
+
+        profile.current_daily_target = int(clamp(new_target, 0, MAX_MAILBOX_DAILY_CAP))
+        profile.mode = mode
+        profile.updated_at = utc_now()
+
+        session.add(
+            RiskSignal(
+                tenant_id=payload.tenant_id,
+                mailbox=mailbox,
+                signal_type="risk_classifier",
+                severity=risk,
+                details=json.dumps(
+                    {
+                        "spam_ewma": profile.spam_ewma,
+                        "bounce_ewma": profile.bounce_ewma,
+                        "complaint_ewma": profile.complaint_ewma,
+                        "reply_ewma": profile.reply_ewma,
+                        "mode": mode,
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+        METRICS["reputation_updates"] += 1
+        json_log("reputation_updated", tenant_id=payload.tenant_id, mailbox=mailbox, mode=mode, risk=risk)
+        return {
+            "tenant_id": payload.tenant_id,
+            "mailbox": mailbox,
+            "ewma": {
+                "inbox": round(profile.inbox_ewma, 4),
+                "spam": round(profile.spam_ewma, 4),
+                "bounce": round(profile.bounce_ewma, 4),
+                "complaint": round(profile.complaint_ewma, 4),
+                "reply": round(profile.reply_ewma, 4),
+            },
+            "risk_score": round(risk, 4),
+            "reputation_score": round(profile.reputation_score, 4),
+            "daily_target": profile.current_daily_target,
+            "mode": mode,
+        }
+
+
+@app.post("/warmup/schedule/generate")
+def generate_schedule(payload: ScheduleRequest) -> dict:
+    mailbox = payload.mailbox.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+        if is_killed(payload.tenant_id, mailbox):
+            raise HTTPException(status_code=423, detail="Kill switch active")
+
+        count = min(payload.requested_count, max(1, profile.current_daily_target))
+        partners, entropy = pick_partners(profile, payload.partner_pool, count)
+        schedule = generate_humanized_schedule(profile, partners, count)
+        session.commit()
+
+        METRICS["schedules_generated"] += 1
+        return {
+            "tenant_id": payload.tenant_id,
+            "mailbox": mailbox,
+            "mode": profile.mode,
+            "daily_target": profile.current_daily_target,
+            "entropy_score": round(entropy, 4),
+            "items": schedule,
+        }
+
+
+@app.post("/warmup/events")
+def record_event(payload: QueueTaskRequest) -> dict:
+    with Session(engine) as session:
+        existing = session.scalar(select(WarmupEvent).where(WarmupEvent.idempotency_key == payload.idempotency_key))
+        if existing:
+            return {
+                "idempotent": True,
+                "event_id": existing.id,
+                "status": existing.status,
+                "retry_count": existing.retry_count,
+            }
+
+        event = WarmupEvent(
+            tenant_id=payload.tenant_id,
+            mailbox=payload.mailbox.lower(),
+            event_type="queue_task",
+            outcome="accepted",
+            queue_name=payload.queue_name,
+            idempotency_key=payload.idempotency_key,
+            status="queued",
+            payload=json.dumps({**payload.payload, "max_attempts": payload.max_attempts}),
+        )
+        session.add(event)
+        session.commit()
+
+        METRICS["events_recorded"] += 1
+        return {"idempotent": False, "event_id": event.id, "status": "queued"}
+
+
+@app.post("/warmup/worker/enqueue")
+def enqueue_task(payload: QueueTaskRequest) -> dict:
+    with Session(engine) as session:
+        existing = session.scalar(select(WarmupEvent).where(WarmupEvent.idempotency_key == payload.idempotency_key))
+        if existing:
+            return {"idempotent": True, "status": existing.status, "event_id": existing.id}
+
+        event = WarmupEvent(
+            tenant_id=payload.tenant_id,
+            mailbox=payload.mailbox.lower(),
+            event_type="queue_task",
+            outcome="accepted",
+            queue_name=payload.queue_name,
+            idempotency_key=payload.idempotency_key,
+            status="queued",
+            payload=json.dumps({**payload.payload, "max_attempts": payload.max_attempts}),
+        )
+        session.add(event)
+        session.commit()
+
+        queue_payload = {
+            "event_id": event.id,
+            "queue_name": payload.queue_name,
+            "tenant_id": payload.tenant_id,
+            "mailbox": payload.mailbox.lower(),
+            "idempotency_key": payload.idempotency_key,
+            **payload.payload,
+            "max_attempts": payload.max_attempts,
+            "attempt": 1,
+        }
+
+        rq_queue = get_rq_queue(payload.queue_name)
+        if rq_queue is not None:
+            rq_queue.enqueue(execute_queue_task, queue_payload, job_id=payload.idempotency_key)
+            backend = "rq"
+        else:
+            IN_MEMORY_QUEUES[payload.queue_name].append(queue_payload)
+            backend = "in-memory"
+
+        METRICS["queue_enqueued"] += 1
+        return {"idempotent": False, "backend": backend, "event_id": event.id, "status": "queued"}
+
+
+@app.post("/warmup/worker/process-next")
+def process_next(queue_name: str = "send_execution") -> dict:
+    if queue_name not in QUEUE_NAMES:
+        raise HTTPException(status_code=400, detail="Invalid queue name")
+
+    rq_queue = get_rq_queue(queue_name)
+    if rq_queue is not None:
+        if rq_queue.count == 0:
+            return {"processed": 0, "backend": "rq"}
+        worker = SimpleWorker([rq_queue], connection=rq_queue.connection)
+        worker.work(burst=True)
+        METRICS["queue_processed"] += 1
+        return {"processed": 1, "backend": "rq"}
+
+    if not IN_MEMORY_QUEUES[queue_name]:
+        return {"processed": 0, "backend": "in-memory"}
+
+    task = IN_MEMORY_QUEUES[queue_name].popleft()
+    with Session(engine) as session:
+        event = session.get(WarmupEvent, task["event_id"])
+        if event is None:
+            raise HTTPException(status_code=404, detail="Queue event not found")
+
+        try:
+            result = execute_queue_task(task)
+            event.status = "processed"
+            event.outcome = "success"
+            session.commit()
+            METRICS["queue_processed"] += 1
+            return {"processed": 1, "backend": "in-memory", "result": result}
+        except Exception as exc:
+            event.retry_count += 1
+            attempts = task.get("attempt", 1)
+            max_attempts = int(task.get("max_attempts", 4))
+            if attempts >= max_attempts:
+                event.status = "dead_letter"
+                event.outcome = "failed"
+                DEAD_LETTER_QUEUE.append({"task": task, "error": str(exc), "failed_at": utc_now().isoformat()})
+                session.add(
+                    RiskSignal(
+                        tenant_id=event.tenant_id,
+                        mailbox=event.mailbox,
+                        signal_type="worker_dead_letter",
+                        severity=0.6,
+                        details=json.dumps({"error": str(exc), "queue": queue_name}),
+                    )
+                )
+                session.commit()
+                METRICS["queue_dead_letter"] += 1
+                return {"processed": 0, "backend": "in-memory", "dead_lettered": True}
+
+            event.status = "retrying"
+            task["attempt"] = attempts + 1
+            task["retry_backoff_seconds"] = 2 ** attempts
+            IN_MEMORY_QUEUES[queue_name].append(task)
+            session.commit()
+            METRICS["queue_retried"] += 1
+            return {"processed": 0, "backend": "in-memory", "retry_scheduled": True}
+
+
+@app.get("/warmup/worker/dlq")
+def list_dlq() -> dict:
+    return {"items": list(DEAD_LETTER_QUEUE)}
+
+
+@app.post("/warmup/deliverability/check")
+def deliverability_check(payload: DeliverabilityCheckRequest) -> dict:
+    domain = payload.domain.lower()
+    mailbox = payload.mailbox.lower()
+
+    spf_aligned = "v=spf1" in maybe_resolve_dns_txt(domain)
+    dmarc_aligned = "v=DMARC1" in maybe_resolve_dns_txt(f"_dmarc.{domain}")
+    dkim_txt = maybe_resolve_dns_txt(f"{payload.dkim_selector}._domainkey.{domain}")
+    dkim_aligned = "k=" in dkim_txt or "v=DKIM1" in dkim_txt
+
+    ptr_valid = payload.ptr_valid if payload.ptr_valid is not None else False
+    tls_supported = payload.tls_supported if payload.tls_supported is not None else True
+
+    score = (
+        (0.18 if spf_aligned else 0.0)
+        + (0.2 if dkim_aligned else 0.0)
+        + (0.2 if dmarc_aligned else 0.0)
+        + (0.12 if ptr_valid else 0.0)
+        + (0.1 if tls_supported else 0.0)
+        + payload.inbox_pct * 0.2
+        + (1 - payload.spam_pct) * 0.08
+    )
+    score = round(clamp(score, 0.0, 1.0), 4)
+
+    placement = "inbox"
+    if payload.spam_pct >= 0.2:
+        placement = "spam"
+    elif payload.promotions_pct >= payload.inbox_pct:
+        placement = "promotions"
+
+    with Session(engine) as session:
+        session.add(
+            DeliverabilitySnapshot(
+                tenant_id=payload.tenant_id,
+                mailbox=mailbox,
+                domain=domain,
+                spf_aligned=spf_aligned,
+                dkim_aligned=dkim_aligned,
+                dmarc_aligned=dmarc_aligned,
+                ptr_valid=ptr_valid,
+                tls_supported=tls_supported,
+                inbox_pct=payload.inbox_pct,
+                promotions_pct=payload.promotions_pct,
+                spam_pct=payload.spam_pct,
+                score=score,
+            )
+        )
+
+        session.add(
+            RiskSignal(
+                tenant_id=payload.tenant_id,
+                mailbox=mailbox,
+                signal_type="deliverability_check",
+                severity=round(1 - score, 4),
+                details=json.dumps({"domain": domain, "placement": placement}),
+            )
+        )
+        session.commit()
+
+    METRICS["deliverability_checks"] += 1
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "domain": domain,
+        "spf_aligned": spf_aligned,
+        "dkim_aligned": dkim_aligned,
+        "dmarc_aligned": dmarc_aligned,
+        "ptr_valid": ptr_valid,
+        "tls_supported": tls_supported,
+        "placement_category": placement,
+        "deliverability_score": score,
+    }
+
+
+@app.post("/warmup/content/plan")
+def content_plan(payload: ContentPlanRequest) -> dict:
+    day = payload.day_number
+    if day <= 7:
+        stage = "foundation"
+        allow_links = False
+        allow_images = False
+        lexical_diversity = 0.25
+    elif day <= 14:
+        stage = "expansion"
+        allow_links = False
+        allow_images = day > 10
+        lexical_diversity = 0.35
+    elif day <= 30:
+        stage = "trust-building"
+        allow_links = True
+        allow_images = True
+        lexical_diversity = 0.45
+    else:
+        stage = "steady-state"
+        allow_links = True
+        allow_images = True
+        lexical_diversity = 0.55
+
+    variant_seed = f"{payload.tenant_id}:{payload.mailbox.lower()}:{day}"
+    signature_variant = int(hash(variant_seed) % 5) + 1
+
+    METRICS["content_plans"] += 1
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": payload.mailbox.lower(),
+        "day_number": day,
+        "stage": stage,
+        "allow_links": allow_links,
+        "allow_images": allow_images,
+        "lexical_diversity": lexical_diversity,
+        "signature_variant": signature_variant,
+        "template_policy": {
+            "semantic_preservation": True,
+            "bounded_mutation": True,
+            "max_template_similarity": 0.86,
+        },
+    }
+
+
+@app.post("/warmup/abuse/check")
+def abuse_check(payload: AbuseCheckRequest) -> dict:
+    mailbox = payload.mailbox.lower()
+    severity = 0.0
+    signals: list[str] = []
+
+    if payload.complaint_spike:
+        severity += 0.4
+        signals.append("complaint_spike")
+    if payload.repeated_bad_domains >= 5:
+        severity += 0.3
+        signals.append("repeated_bad_domains")
+    if payload.anomalous_burstiness >= 0.7:
+        severity += 0.35
+        signals.append("anomalous_burstiness")
+
+    severity = clamp(severity, 0.0, 1.0)
+    blocked = severity >= 0.65
+
+    with Session(engine) as session:
+        session.add(
+            RiskSignal(
+                tenant_id=payload.tenant_id,
+                mailbox=mailbox,
+                signal_type="abuse_heuristics",
+                severity=severity,
+                details=json.dumps({"signals": signals}),
+            )
+        )
+
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+        if blocked:
+            profile.mode = "paused"
+            profile.current_daily_target = 0
+        session.commit()
+
+    METRICS["abuse_checks"] += 1
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "severity": round(severity, 4),
+        "signals": signals,
+        "blocked": blocked,
+    }
+
+
+@app.post("/warmup/kill-switch")
+def set_kill_switch(payload: KillSwitchRequest) -> dict:
+    global GLOBAL_KILL_SWITCH
+
+    if payload.scope == "global":
+        GLOBAL_KILL_SWITCH = payload.enabled
+    elif payload.scope == "tenant":
+        if not payload.value:
+            raise HTTPException(status_code=400, detail="tenant scope requires value")
+        if payload.enabled:
+            TENANT_KILL_SWITCHES.add(payload.value)
+        else:
+            TENANT_KILL_SWITCHES.discard(payload.value)
+    elif payload.scope == "provider":
+        if not payload.value:
+            raise HTTPException(status_code=400, detail="provider scope requires value")
+        provider = payload.value.lower()
+        if payload.enabled:
+            PROVIDER_KILL_SWITCHES.add(provider)
+        else:
+            PROVIDER_KILL_SWITCHES.discard(provider)
+
+    METRICS["kill_switch_updates"] += 1
+    return {
+        "global": GLOBAL_KILL_SWITCH,
+        "tenants": sorted(TENANT_KILL_SWITCHES),
+        "providers": sorted(PROVIDER_KILL_SWITCHES),
+    }
