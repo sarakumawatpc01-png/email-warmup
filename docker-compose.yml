@@ -44,8 +44,64 @@ services:
 
   warmup_engine:
     build: ./warmup-engine
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+      PROMETHEUS_ENABLED: "true"
+      OTEL_ENABLE_CONSOLE_EXPORTER: "false"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    depends_on:
+      - redis
     ports:
       - "8003:8003"
+    networks:
+      - app-net
+
+  warmup_worker_schedule_generation:
+    build: ./warmup-engine
+    command: ["rq", "worker", "schedule_generation", "--url", "redis://redis:6379/0"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+    depends_on:
+      - redis
+      - warmup_engine
+    networks:
+      - app-net
+
+  warmup_worker_send_execution:
+    build: ./warmup-engine
+    command: ["rq", "worker", "send_execution", "--url", "redis://redis:6379/0"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+    depends_on:
+      - redis
+      - warmup_engine
+    networks:
+      - app-net
+
+  warmup_worker_reply_simulation:
+    build: ./warmup-engine
+    command: ["rq", "worker", "reply_simulation", "--url", "redis://redis:6379/0"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+    depends_on:
+      - redis
+      - warmup_engine
+    networks:
+      - app-net
+
+  warmup_worker_reputation_scoring:
+    build: ./warmup-engine
+    command: ["rq", "worker", "reputation_scoring", "--url", "redis://redis:6379/0"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+    depends_on:
+      - redis
+      - warmup_engine
     networks:
       - app-net
 

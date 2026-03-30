@@ -5,16 +5,35 @@ import logging
 import math
 import os
 import random
+import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+except Exception:  # pragma: no cover - optional runtime capability
+    trace = None
+    OTLPSpanExporter = None
+    FastAPIInstrumentor = None
+    Resource = None
+    TracerProvider = None
+    BatchSpanProcessor = None
+    ConsoleSpanExporter = None
 
 try:
     import dns.resolver
@@ -38,6 +57,9 @@ EWMA_ALPHA = float(os.getenv("WARMUP_EWMA_ALPHA", "0.35"))
 MAX_MAILBOX_DAILY_CAP = int(os.getenv("MAX_MAILBOX_DAILY_CAP", "250"))
 MAX_TENANT_DAILY_CAP = int(os.getenv("MAX_TENANT_DAILY_CAP", "5000"))
 REDIS_URL = os.getenv("REDIS_URL", "")
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
+PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "true").lower() == "true"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -53,6 +75,81 @@ TENANT_KILL_SWITCHES: set[str] = set()
 PROVIDER_KILL_SWITCHES: set[str] = set()
 
 QUEUE_NAMES = {"schedule_generation", "send_execution", "reply_simulation", "reputation_scoring"}
+
+PROVIDER_PROFILES: dict[str, dict[str, float]] = {
+    "gmail.com": {
+        "kp": 0.30,
+        "ki": 0.07,
+        "kd": 0.15,
+        "quality_setpoint": 0.68,
+        "spam_soft_threshold": 0.035,
+        "bounce_soft_threshold": 0.022,
+        "spam_risk_trigger": 0.42,
+        "quarantine_risk_trigger": 0.60,
+        "max_step": 26.0,
+    },
+    "outlook.com": {
+        "kp": 0.33,
+        "ki": 0.08,
+        "kd": 0.17,
+        "quality_setpoint": 0.66,
+        "spam_soft_threshold": 0.040,
+        "bounce_soft_threshold": 0.026,
+        "spam_risk_trigger": 0.43,
+        "quarantine_risk_trigger": 0.61,
+        "max_step": 28.0,
+    },
+    "yahoo.com": {
+        "kp": 0.28,
+        "ki": 0.06,
+        "kd": 0.14,
+        "quality_setpoint": 0.67,
+        "spam_soft_threshold": 0.038,
+        "bounce_soft_threshold": 0.025,
+        "spam_risk_trigger": 0.41,
+        "quarantine_risk_trigger": 0.59,
+        "max_step": 24.0,
+    },
+    "default": {
+        "kp": 0.35,
+        "ki": 0.08,
+        "kd": 0.18,
+        "quality_setpoint": 0.65,
+        "spam_soft_threshold": 0.045,
+        "bounce_soft_threshold": 0.03,
+        "spam_risk_trigger": 0.4,
+        "quarantine_risk_trigger": 0.6,
+        "max_step": 35.0,
+    },
+}
+
+PROM_HTTP_REQUESTS_TOTAL = Counter(
+    "warmup_http_requests_total",
+    "Total warmup-engine HTTP requests",
+    ["method", "path", "status_code"],
+)
+PROM_HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "warmup_http_request_duration_seconds",
+    "Warmup-engine HTTP request duration in seconds",
+    ["method", "path"],
+)
+PROM_QUEUE_BACKLOG = Gauge(
+    "warmup_queue_backlog",
+    "Current warmup queue backlog depth",
+    ["queue_name", "backend"],
+)
+PROM_SLO_SEND_SUCCESS_RATIO = Gauge(
+    "warmup_slo_send_success_ratio",
+    "SLO gauge for send success ratio",
+)
+PROM_SLO_PLACEMENT_SCORE = Gauge(
+    "warmup_slo_placement_score",
+    "SLO gauge for inbox placement score",
+)
+PROM_SLO_QUEUE_LATENCY_SECONDS = Gauge(
+    "warmup_slo_queue_latency_seconds",
+    "SLO gauge for queue latency proxy in seconds",
+)
 
 
 class Base(DeclarativeBase):
@@ -184,6 +281,21 @@ class RiskSignal(Base):
 
 Base.metadata.create_all(engine)
 
+if trace and TracerProvider and BatchSpanProcessor:
+    resource = Resource.create({"service.name": "warmup-engine"}) if Resource else None
+    provider = TracerProvider(resource=resource)
+    if OTEL_EXPORTER_OTLP_ENDPOINT and OTLPSpanExporter:
+        provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{OTEL_EXPORTER_OTLP_ENDPOINT.rstrip('/')}/v1/traces"))
+        )
+    elif OTEL_ENABLE_CONSOLE_EXPORTER and ConsoleSpanExporter:
+        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    trace.set_tracer_provider(provider)
+    if FastAPIInstrumentor:
+        FastAPIInstrumentor.instrument_app(app)
+
+TRACER = trace.get_tracer("warmup-engine") if trace else None
+
 
 class WarmupJobRequest(BaseModel):
     tenant_id: str = Field(min_length=2, max_length=64)
@@ -250,6 +362,11 @@ class AbuseCheckRequest(BaseModel):
     complaint_spike: bool = False
     repeated_bad_domains: int = Field(default=0, ge=0)
     anomalous_burstiness: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+def provider_profile_for_mailbox(mailbox: str) -> dict[str, float]:
+    provider = provider_from_mailbox(mailbox)
+    return PROVIDER_PROFILES.get(provider, PROVIDER_PROFILES["default"])
 
 
 def utc_now() -> datetime:
@@ -440,24 +557,33 @@ def quality_score(profile: MailboxProfile) -> float:
 
 
 def apply_adaptive_policy(profile: MailboxProfile, risk: float, blacklist_detected: bool) -> tuple[int, str]:
-    kp, ki, kd = 0.35, 0.08, 0.18
+    profile_cfg = provider_profile_for_mailbox(profile.mailbox)
+    kp, ki, kd = profile_cfg["kp"], profile_cfg["ki"], profile_cfg["kd"]
+    quality_setpoint = profile_cfg["quality_setpoint"]
+    spam_soft_threshold = profile_cfg["spam_soft_threshold"]
+    bounce_soft_threshold = profile_cfg["bounce_soft_threshold"]
+    spam_risk_trigger = profile_cfg["spam_risk_trigger"]
+    quarantine_risk_trigger = profile_cfg["quarantine_risk_trigger"]
+    max_step = profile_cfg["max_step"]
+
     quality = quality_score(profile)
-    error = quality - 0.65
+    error = quality - quality_setpoint
 
     profile.pid_integral = clamp(profile.pid_integral + error, -5.0, 5.0)
     derivative = error - profile.pid_prev_error
     profile.pid_prev_error = error
 
     delta = kp * error + ki * profile.pid_integral + kd * derivative
-    candidate = int(round(profile.current_daily_target + (delta * 35)))
+    candidate = int(round(profile.current_daily_target + (delta * max_step)))
     candidate = int(clamp(candidate, 1, MAX_MAILBOX_DAILY_CAP))
 
     mode = profile.mode
-    if blacklist_detected or risk >= 0.6:
+    sender_pressure_high = profile.spam_ewma >= spam_soft_threshold or profile.bounce_ewma >= bounce_soft_threshold
+    if blacklist_detected or risk >= quarantine_risk_trigger:
         mode = "quarantine"
         candidate = min(candidate, 5)
         profile.stable_windows = 0
-    elif risk >= 0.4:
+    elif risk >= spam_risk_trigger or sender_pressure_high:
         mode = "throttle"
         candidate = min(candidate, max(10, int(profile.current_daily_target * 0.7)))
         profile.stable_windows = 0
@@ -507,6 +633,25 @@ def execute_queue_task(payload: dict[str, Any]) -> dict[str, Any]:
     return {"status": "processed", "queue": queue_name, "processed_at": utc_now().isoformat()}
 
 
+def refresh_slo_metrics() -> None:
+    processed = METRICS.get("queue_processed", 0)
+    failed = METRICS.get("queue_dead_letter", 0)
+    total = processed + failed
+    send_success_ratio = (processed / total) if total else 1.0
+    PROM_SLO_SEND_SUCCESS_RATIO.set(send_success_ratio)
+
+    placement_score = max(0.0, 1.0 - (METRICS.get("deliverability_spam_events", 0) / max(1, METRICS.get("deliverability_checks", 1))))
+    PROM_SLO_PLACEMENT_SCORE.set(placement_score)
+
+    retry_events = METRICS.get("queue_retried", 0)
+    PROM_SLO_QUEUE_LATENCY_SECONDS.set(float(retry_events))
+
+
+def refresh_queue_backlog_metrics() -> None:
+    for queue_name in QUEUE_NAMES:
+        PROM_QUEUE_BACKLOG.labels(queue_name=queue_name, backend="in-memory").set(len(IN_MEMORY_QUEUES[queue_name]))
+
+
 def get_rq_queue(queue_name: str):
     if not (REDIS_URL and Redis and Queue):
         return None
@@ -527,6 +672,35 @@ def health() -> dict:
 @app.get("/metrics")
 def metrics() -> dict:
     return {"counters": dict(METRICS), "dead_letter_queue_size": len(DEAD_LETTER_QUEUE)}
+
+
+@app.get("/metrics/prometheus")
+def metrics_prometheus() -> Response:
+    if not PROMETHEUS_ENABLED:
+        raise HTTPException(status_code=404, detail="Prometheus exporter disabled")
+    refresh_slo_metrics()
+    refresh_queue_backlog_metrics()
+    return PlainTextResponse(generate_latest().decode("utf-8"), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.middleware("http")
+async def prometheus_http_middleware(request: Request, call_next):
+    if not PROMETHEUS_ENABLED:
+        return await call_next(request)
+
+    path = request.url.path
+    method = request.method
+    start = time.perf_counter()
+    if TRACER:
+        with TRACER.start_as_current_span(f"http {method} {path}"):
+            response = await call_next(request)
+    else:
+        response = await call_next(request)
+
+    elapsed = time.perf_counter() - start
+    PROM_HTTP_REQUEST_DURATION_SECONDS.labels(method=method, path=path).observe(elapsed)
+    PROM_HTTP_REQUESTS_TOTAL.labels(method=method, path=path, status_code=str(response.status_code)).inc()
+    return response
 
 
 @app.post("/warmup/jobs")
@@ -778,6 +952,7 @@ def enqueue_task(payload: QueueTaskRequest) -> dict:
             backend = "in-memory"
 
         METRICS["queue_enqueued"] += 1
+        refresh_queue_backlog_metrics()
         return {"idempotent": False, "backend": backend, "event_id": event.id, "status": "queued"}
 
 
@@ -796,6 +971,7 @@ def process_next(queue_name: str = "send_execution") -> dict:
         return {"processed": 1, "backend": "rq"}
 
     if not IN_MEMORY_QUEUES[queue_name]:
+        refresh_queue_backlog_metrics()
         return {"processed": 0, "backend": "in-memory"}
 
     task = IN_MEMORY_QUEUES[queue_name].popleft()
@@ -810,6 +986,8 @@ def process_next(queue_name: str = "send_execution") -> dict:
             event.outcome = "success"
             session.commit()
             METRICS["queue_processed"] += 1
+            refresh_slo_metrics()
+            refresh_queue_backlog_metrics()
             return {"processed": 1, "backend": "in-memory", "result": result}
         except Exception as exc:
             event.retry_count += 1
@@ -830,6 +1008,8 @@ def process_next(queue_name: str = "send_execution") -> dict:
                 )
                 session.commit()
                 METRICS["queue_dead_letter"] += 1
+                refresh_slo_metrics()
+                refresh_queue_backlog_metrics()
                 return {"processed": 0, "backend": "in-memory", "dead_lettered": True}
 
             event.status = "retrying"
@@ -838,6 +1018,8 @@ def process_next(queue_name: str = "send_execution") -> dict:
             IN_MEMORY_QUEUES[queue_name].append(task)
             session.commit()
             METRICS["queue_retried"] += 1
+            refresh_slo_metrics()
+            refresh_queue_backlog_metrics()
             return {"processed": 0, "backend": "in-memory", "retry_scheduled": True}
 
 
@@ -873,6 +1055,7 @@ def deliverability_check(payload: DeliverabilityCheckRequest) -> dict:
     placement = "inbox"
     if payload.spam_pct >= 0.2:
         placement = "spam"
+        METRICS["deliverability_spam_events"] += 1
     elif payload.promotions_pct >= payload.inbox_pct:
         placement = "promotions"
 
