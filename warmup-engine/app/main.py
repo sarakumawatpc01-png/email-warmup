@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -62,6 +62,7 @@ OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false"
 PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "true").lower() == "true"
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev")
 SERVICE_NAME = "warmup-engine"
+ADMIN_API_KEY = os.getenv("WARMUP_ADMIN_API_KEY", "")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -284,6 +285,39 @@ class RiskSignal(Base):
     )
 
 
+class InternalMailbox(Base):
+    __tablename__ = "internal_mailboxes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    provider: Mapped[str] = mapped_column(String(120))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    notes: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_internal_mailboxes_tenant_mailbox", "tenant_id", "mailbox", unique=True),
+    )
+
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    actor: Mapped[str] = mapped_column(String(120), index=True)
+    action: Mapped[str] = mapped_column(String(120), index=True)
+    resource_type: Mapped[str] = mapped_column(String(120))
+    resource_id: Mapped[str] = mapped_column(String(255), default="")
+    details: Mapped[str] = mapped_column(String, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 Base.metadata.create_all(engine)
 
 if trace and TracerProvider and BatchSpanProcessor:
@@ -369,6 +403,18 @@ class AbuseCheckRequest(BaseModel):
     anomalous_burstiness: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
+class InternalMailboxRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    notes: str = ""
+
+
+class DlqReplayRequest(BaseModel):
+    item_index: int = Field(ge=0)
+    approved_by: str = Field(min_length=2, max_length=120)
+    reason: str = Field(min_length=3, max_length=255)
+
+
 def provider_profile_for_mailbox(mailbox: str) -> dict[str, float]:
     provider = provider_from_mailbox(mailbox)
     return PROVIDER_PROFILES.get(provider, PROVIDER_PROFILES["default"])
@@ -393,6 +439,33 @@ def provider_from_mailbox(mailbox: str) -> str:
 
 def json_log(event: str, **kwargs: Any) -> None:
     logger.info(json.dumps({"event": event, **kwargs}, default=str))
+
+
+def require_admin(api_key: str | None) -> None:
+    if not ADMIN_API_KEY:
+        return
+    if not api_key or api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Admin API key required")
+
+
+def write_admin_audit_log(
+    session: Session,
+    *,
+    actor: str,
+    action: str,
+    resource_type: str,
+    resource_id: str = "",
+    details: dict[str, Any] | None = None,
+) -> None:
+    session.add(
+        AdminAuditLog(
+            actor=actor,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            details=json.dumps(details or {}),
+        )
+    )
 
 
 def base_target_from_domain_age(domain_age_days: int) -> int:
@@ -1042,6 +1115,43 @@ def list_dlq() -> dict:
     return {"items": list(DEAD_LETTER_QUEUE)}
 
 
+@app.post("/warmup/worker/dlq/replay")
+def replay_dlq_task(
+    payload: DlqReplayRequest,
+    x_admin_api_key: str | None = Header(default=None),
+    x_admin_actor: str = Header(default="system"),
+) -> dict:
+    require_admin(x_admin_api_key)
+    if payload.item_index >= len(DEAD_LETTER_QUEUE):
+        raise HTTPException(status_code=404, detail="DLQ item not found")
+
+    item = DEAD_LETTER_QUEUE[payload.item_index]
+    task = dict(item.get("task") or {})
+    queue_name = task.get("queue_name", "send_execution")
+    if queue_name not in QUEUE_NAMES:
+        raise HTTPException(status_code=400, detail="DLQ item has invalid queue")
+
+    task["attempt"] = 1
+    task["replayed_at"] = utc_now().isoformat()
+    IN_MEMORY_QUEUES[queue_name].append(task)
+    DEAD_LETTER_QUEUE.remove(item)
+    refresh_queue_backlog_metrics()
+
+    with Session(engine) as session:
+        write_admin_audit_log(
+            session,
+            actor=x_admin_actor,
+            action="dlq_replay",
+            resource_type="warmup_event",
+            resource_id=str(task.get("event_id", "")),
+            details={"queue_name": queue_name, "reason": payload.reason, "approved_by": payload.approved_by},
+        )
+        session.commit()
+
+    METRICS["queue_replayed"] += 1
+    return {"replayed": True, "queue_name": queue_name, "event_id": task.get("event_id")}
+
+
 @app.post("/warmup/deliverability/check")
 def deliverability_check(payload: DeliverabilityCheckRequest) -> dict:
     domain = payload.domain.lower()
@@ -1209,8 +1319,13 @@ def abuse_check(payload: AbuseCheckRequest) -> dict:
 
 
 @app.post("/warmup/kill-switch")
-def set_kill_switch(payload: KillSwitchRequest) -> dict:
+def set_kill_switch(
+    payload: KillSwitchRequest,
+    x_admin_api_key: str | None = Header(default=None),
+    x_admin_actor: str = Header(default="system"),
+) -> dict:
     global GLOBAL_KILL_SWITCH
+    require_admin(x_admin_api_key)
 
     if payload.scope == "global":
         GLOBAL_KILL_SWITCH = payload.enabled
@@ -1230,9 +1345,161 @@ def set_kill_switch(payload: KillSwitchRequest) -> dict:
         else:
             PROVIDER_KILL_SWITCHES.discard(provider)
 
+    with Session(engine) as session:
+        write_admin_audit_log(
+            session,
+            actor=x_admin_actor,
+            action="kill_switch_update",
+            resource_type="kill_switch",
+            resource_id=payload.scope,
+            details={"enabled": payload.enabled, "value": payload.value},
+        )
+        session.commit()
+
     METRICS["kill_switch_updates"] += 1
     return {
         "global": GLOBAL_KILL_SWITCH,
         "tenants": sorted(TENANT_KILL_SWITCHES),
         "providers": sorted(PROVIDER_KILL_SWITCHES),
     }
+
+
+@app.post("/warmup/admin/internal-mailboxes")
+def upsert_internal_mailbox(
+    payload: InternalMailboxRequest,
+    x_admin_api_key: str | None = Header(default=None),
+    x_admin_actor: str = Header(default="system"),
+) -> dict:
+    require_admin(x_admin_api_key)
+    mailbox = payload.mailbox.lower()
+    provider = provider_from_mailbox(mailbox)
+    with Session(engine) as session:
+        item = session.scalar(
+            select(InternalMailbox).where(
+                InternalMailbox.tenant_id == payload.tenant_id, InternalMailbox.mailbox == mailbox
+            )
+        )
+        created = False
+        if item is None:
+            item = InternalMailbox(tenant_id=payload.tenant_id, mailbox=mailbox, provider=provider, notes=payload.notes)
+            session.add(item)
+            created = True
+        else:
+            item.provider = provider
+            item.notes = payload.notes
+            item.is_active = True
+        write_admin_audit_log(
+            session,
+            actor=x_admin_actor,
+            action="internal_mailbox_upsert",
+            resource_type="internal_mailbox",
+            resource_id=f"{payload.tenant_id}:{mailbox}",
+            details={"provider": provider, "created": created},
+        )
+        session.commit()
+
+    return {
+        "created": created,
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "provider": provider,
+        "notes": payload.notes,
+        "is_active": True,
+    }
+
+
+@app.get("/warmup/admin/internal-mailboxes")
+def list_internal_mailboxes(tenant_id: str | None = None) -> dict:
+    with Session(engine) as session:
+        stmt = select(InternalMailbox)
+        if tenant_id:
+            stmt = stmt.where(InternalMailbox.tenant_id == tenant_id)
+        records = session.scalars(stmt.order_by(InternalMailbox.tenant_id, InternalMailbox.mailbox)).all()
+        return {
+            "items": [
+                {
+                    "tenant_id": record.tenant_id,
+                    "mailbox": record.mailbox,
+                    "provider": record.provider,
+                    "is_active": record.is_active,
+                    "notes": record.notes,
+                }
+                for record in records
+            ]
+        }
+
+
+@app.get("/warmup/admin/mailbox-health")
+def mailbox_health(tenant_id: str, mailbox: str, limit: int = 20) -> dict:
+    mailbox_normalized = mailbox.lower()
+    capped_limit = max(1, min(limit, 100))
+    with Session(engine) as session:
+        profile = session.scalar(
+            select(MailboxProfile).where(MailboxProfile.tenant_id == tenant_id, MailboxProfile.mailbox == mailbox_normalized)
+        )
+        snapshots = session.scalars(
+            select(DeliverabilitySnapshot)
+            .where(DeliverabilitySnapshot.tenant_id == tenant_id, DeliverabilitySnapshot.mailbox == mailbox_normalized)
+            .order_by(DeliverabilitySnapshot.created_at.desc())
+            .limit(capped_limit)
+        ).all()
+        events = session.scalars(
+            select(WarmupEvent)
+            .where(WarmupEvent.tenant_id == tenant_id, WarmupEvent.mailbox == mailbox_normalized)
+            .order_by(WarmupEvent.created_at.desc())
+            .limit(capped_limit)
+        ).all()
+
+    return {
+        "tenant_id": tenant_id,
+        "mailbox": mailbox_normalized,
+        "profile": (
+            {
+                "mode": profile.mode,
+                "daily_target": profile.current_daily_target,
+                "risk_score": round(profile.risk_score, 4),
+                "reputation_score": round(profile.reputation_score, 4),
+            }
+            if profile
+            else None
+        ),
+        "deliverability_timeline": [
+            {
+                "created_at": snapshot.created_at.isoformat(),
+                "score": snapshot.score,
+                "inbox_pct": snapshot.inbox_pct,
+                "spam_pct": snapshot.spam_pct,
+            }
+            for snapshot in snapshots
+        ],
+        "event_timeline": [
+            {
+                "id": event.id,
+                "status": event.status,
+                "queue_name": event.queue_name,
+                "retry_count": event.retry_count,
+                "created_at": event.created_at.isoformat(),
+            }
+            for event in events
+        ],
+    }
+
+
+@app.get("/warmup/admin/audit-logs")
+def list_admin_audit_logs(limit: int = 100) -> dict:
+    capped_limit = max(1, min(limit, 300))
+    with Session(engine) as session:
+        rows = session.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc()).limit(capped_limit)).all()
+        return {
+            "items": [
+                {
+                    "actor": row.actor,
+                    "action": row.action,
+                    "resource_type": row.resource_type,
+                    "resource_id": row.resource_id,
+                    "details": json.loads(row.details or "{}"),
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+        }

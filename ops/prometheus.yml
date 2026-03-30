@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "warmup-engine"
+    static_configs:
+      - targets: ["warmup_engine:8003"]
+    metrics_path: /metrics/prometheus

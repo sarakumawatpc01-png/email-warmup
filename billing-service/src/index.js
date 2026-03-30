@@ -19,6 +19,62 @@ const app = express();
 const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = stripeSecret ? new Stripe(stripeSecret) : null;
+const billingAdminApiKey = process.env.BILLING_ADMIN_API_KEY || '';
+
+const paymentProviders = {
+  stripe: {
+    enabled: Boolean(stripeSecret),
+    key_id: process.env.STRIPE_PUBLISHABLE_KEY || '',
+    secret_set: Boolean(stripeSecret),
+    webhook_secret_set: Boolean(stripeWebhookSecret),
+    mode: process.env.STRIPE_MODE || 'test',
+  },
+  razorpay: {
+    enabled: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
+    key_id: process.env.RAZORPAY_KEY_ID || '',
+    secret_set: Boolean(process.env.RAZORPAY_KEY_SECRET),
+    webhook_secret_set: Boolean(process.env.RAZORPAY_WEBHOOK_SECRET),
+    mode: process.env.RAZORPAY_MODE || 'test',
+  },
+  phonepe: {
+    enabled: Boolean(process.env.PHONEPE_MERCHANT_ID && process.env.PHONEPE_SALT_KEY),
+    merchant_id: process.env.PHONEPE_MERCHANT_ID || '',
+    secret_set: Boolean(process.env.PHONEPE_SALT_KEY),
+    webhook_secret_set: Boolean(process.env.PHONEPE_WEBHOOK_SECRET),
+    mode: process.env.PHONEPE_MODE || 'test',
+  },
+  paytm: {
+    enabled: Boolean(process.env.PAYTM_MERCHANT_ID && process.env.PAYTM_MERCHANT_KEY),
+    merchant_id: process.env.PAYTM_MERCHANT_ID || '',
+    secret_set: Boolean(process.env.PAYTM_MERCHANT_KEY),
+    webhook_secret_set: Boolean(process.env.PAYTM_WEBHOOK_SECRET),
+    mode: process.env.PAYTM_MODE || 'test',
+  },
+};
+
+function verifyAdmin(req) {
+  if (!billingAdminApiKey) {
+    return true;
+  }
+  return req.headers['x-admin-api-key'] === billingAdminApiKey;
+}
+
+function auditLog(event, details = {}) {
+  console.log(JSON.stringify({ event, ...details, at: new Date().toISOString() }));
+}
+
+function verifyHmac(bodyBuffer, signature, secret) {
+  if (!secret || !signature) {
+    return false;
+  }
+  const digest = crypto.createHmac('sha256', secret).update(bodyBuffer).digest('hex');
+  const left = Buffer.from(digest);
+  const right = Buffer.from(String(signature));
+  if (left.length !== right.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(left, right);
+}
 
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
   if (!stripe || !stripeWebhookSecret) {
@@ -33,6 +89,42 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, re
     console.error('Stripe webhook verification failed');
     return res.status(400).json({ error: 'Invalid webhook signature' });
   }
+});
+
+app.post('/webhooks/razorpay', express.raw({ type: 'application/json' }), (req, res) => {
+  const secret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+  if (!secret) {
+    return res.status(200).json({ accepted: true, note: 'razorpay not configured' });
+  }
+  const signature = req.headers['x-razorpay-signature'];
+  if (!verifyHmac(req.body, signature, secret)) {
+    return res.status(400).json({ error: 'Invalid Razorpay webhook signature' });
+  }
+  return res.json({ received: true });
+});
+
+app.post('/webhooks/phonepe', express.raw({ type: 'application/json' }), (req, res) => {
+  const secret = process.env.PHONEPE_WEBHOOK_SECRET || '';
+  if (!secret) {
+    return res.status(200).json({ accepted: true, note: 'phonepe not configured' });
+  }
+  const signature = req.headers['x-phonepe-signature'];
+  if (!verifyHmac(req.body, signature, secret)) {
+    return res.status(400).json({ error: 'Invalid PhonePe webhook signature' });
+  }
+  return res.json({ received: true });
+});
+
+app.post('/webhooks/paytm', express.raw({ type: 'application/json' }), (req, res) => {
+  const secret = process.env.PAYTM_WEBHOOK_SECRET || '';
+  if (!secret) {
+    return res.status(200).json({ accepted: true, note: 'paytm not configured' });
+  }
+  const signature = req.headers['x-paytm-signature'];
+  if (!verifyHmac(req.body, signature, secret)) {
+    return res.status(400).json({ error: 'Invalid Paytm webhook signature' });
+  }
+  return res.json({ received: true });
 });
 
 app.use(express.json());
@@ -79,6 +171,47 @@ app.post('/subscriptions/preview', async (req, res) => {
     amount_usd: pricing[plan] * quantity,
     stripe_enabled: Boolean(stripe),
   });
+});
+
+app.get('/admin/payments/providers', (req, res) => {
+  if (!verifyAdmin(req)) {
+    return res.status(403).json({ error: 'Admin API key required' });
+  }
+  return res.json({ providers: paymentProviders });
+});
+
+app.post('/admin/payments/providers/:provider/setup', (req, res) => {
+  if (!verifyAdmin(req)) {
+    return res.status(403).json({ error: 'Admin API key required' });
+  }
+  const provider = req.params.provider;
+  if (!paymentProviders[provider]) {
+    return res.status(404).json({ error: 'Provider not supported' });
+  }
+  const config = req.body || {};
+  if (provider === 'stripe') {
+    paymentProviders.stripe.key_id = config.key_id || paymentProviders.stripe.key_id;
+    paymentProviders.stripe.secret_set = Boolean(config.secret || paymentProviders.stripe.secret_set);
+    paymentProviders.stripe.webhook_secret_set = Boolean(config.webhook_secret || paymentProviders.stripe.webhook_secret_set);
+    paymentProviders.stripe.enabled = Boolean(paymentProviders.stripe.key_id && paymentProviders.stripe.secret_set);
+  } else if (provider === 'razorpay') {
+    paymentProviders.razorpay.key_id = config.key_id || paymentProviders.razorpay.key_id;
+    paymentProviders.razorpay.secret_set = Boolean(config.secret || paymentProviders.razorpay.secret_set);
+    paymentProviders.razorpay.webhook_secret_set = Boolean(config.webhook_secret || paymentProviders.razorpay.webhook_secret_set);
+    paymentProviders.razorpay.enabled = Boolean(paymentProviders.razorpay.key_id && paymentProviders.razorpay.secret_set);
+  } else if (provider === 'phonepe') {
+    paymentProviders.phonepe.merchant_id = config.merchant_id || paymentProviders.phonepe.merchant_id;
+    paymentProviders.phonepe.secret_set = Boolean(config.secret || paymentProviders.phonepe.secret_set);
+    paymentProviders.phonepe.webhook_secret_set = Boolean(config.webhook_secret || paymentProviders.phonepe.webhook_secret_set);
+    paymentProviders.phonepe.enabled = Boolean(paymentProviders.phonepe.merchant_id && paymentProviders.phonepe.secret_set);
+  } else if (provider === 'paytm') {
+    paymentProviders.paytm.merchant_id = config.merchant_id || paymentProviders.paytm.merchant_id;
+    paymentProviders.paytm.secret_set = Boolean(config.secret || paymentProviders.paytm.secret_set);
+    paymentProviders.paytm.webhook_secret_set = Boolean(config.webhook_secret || paymentProviders.paytm.webhook_secret_set);
+    paymentProviders.paytm.enabled = Boolean(paymentProviders.paytm.merchant_id && paymentProviders.paytm.secret_set);
+  }
+  auditLog('payment_provider_setup', { provider, actor: req.headers['x-admin-actor'] || 'unknown' });
+  return res.json({ provider, config: paymentProviders[provider] });
 });
 
 process.on('SIGTERM', async () => {

@@ -50,6 +50,7 @@ services:
       PROMETHEUS_ENABLED: "true"
       OTEL_ENABLE_CONSOLE_EXPORTER: "false"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      WARMUP_ADMIN_API_KEY: ${WARMUP_ADMIN_API_KEY:-}
     depends_on:
       - redis
     ports:
@@ -149,8 +150,52 @@ services:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      BILLING_ADMIN_API_KEY: ${BILLING_ADMIN_API_KEY:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      PHONEPE_MERCHANT_ID: ${PHONEPE_MERCHANT_ID:-}
+      PHONEPE_SALT_KEY: ${PHONEPE_SALT_KEY:-}
+      PHONEPE_WEBHOOK_SECRET: ${PHONEPE_WEBHOOK_SECRET:-}
+      PAYTM_MERCHANT_ID: ${PAYTM_MERCHANT_ID:-}
+      PAYTM_MERCHANT_KEY: ${PAYTM_MERCHANT_KEY:-}
+      PAYTM_WEBHOOK_SECRET: ${PAYTM_WEBHOOK_SECRET:-}
     ports:
       - "3001:3001"
+    networks:
+      - app-net
+
+  otel_collector:
+    image: otel/opentelemetry-collector-contrib:0.105.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./ops/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4318:4318"
+      - "4317:4317"
+    networks:
+      - app-net
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - app-net
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/grafana-dashboard-warmup.json:/var/lib/grafana/dashboards/warmup.json:ro
+    ports:
+      - "3003:3000"
     networks:
       - app-net
 
@@ -204,6 +249,7 @@ services:
 
 volumes:
   pg_data:
+  grafana_data:
 
 networks:
   app-net:

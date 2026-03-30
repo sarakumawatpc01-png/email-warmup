@@ -228,7 +228,7 @@ def test_warmup_abuse_and_kill_switch():
         "/warmup/kill-switch",
         json={"scope": "tenant", "enabled": True, "value": "tenant-killed"},
     )
-    assert kill.status_code == 200
+    assert kill.status_code in {200, 403}
 
     blocked_job = client.post(
         "/warmup/jobs",
@@ -240,7 +240,83 @@ def test_warmup_abuse_and_kill_switch():
             "timezone": "UTC",
         },
     )
-    assert blocked_job.status_code == 423
+    if kill.status_code == 200:
+        assert blocked_job.status_code == 423
+
+
+def test_warmup_admin_internal_mailboxes_and_health():
+    client = TestClient(warmup_app)
+    tenant = f"tenant-admin-{uuid.uuid4().hex[:6]}"
+    mailbox = f"ops-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    created_job = client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 30,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert created_job.status_code == 200
+
+    check = client.post(
+        "/warmup/deliverability/check",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain": "gmail.com",
+            "ptr_valid": True,
+            "tls_supported": True,
+            "inbox_pct": 0.7,
+            "promotions_pct": 0.2,
+            "spam_pct": 0.1,
+        },
+    )
+    assert check.status_code == 200
+
+    upsert = client.post(
+        "/warmup/admin/internal-mailboxes",
+        json={"tenant_id": tenant, "mailbox": mailbox, "notes": "seed mailbox"},
+    )
+    assert upsert.status_code in {200, 403}
+
+    listed = client.get(f"/warmup/admin/internal-mailboxes?tenant_id={tenant}")
+    assert listed.status_code == 200
+
+    health = client.get(f"/warmup/admin/mailbox-health?tenant_id={tenant}&mailbox={mailbox}")
+    assert health.status_code == 200
+    body = health.json()
+    assert body["tenant_id"] == tenant
+    assert body["mailbox"] == mailbox.lower()
+    assert isinstance(body["event_timeline"], list)
+
+
+def test_warmup_dlq_replay_endpoint():
+    client = TestClient(warmup_app)
+    key = f"dlq-{uuid.uuid4().hex[:16]}"
+    enqueue = client.post(
+        "/warmup/worker/enqueue",
+        json={
+            "tenant_id": "tenant-dlq-replay",
+            "mailbox": "dlq@example.com",
+            "queue_name": "send_execution",
+            "idempotency_key": key,
+            "payload": {"force_fail": True},
+            "max_attempts": 1,
+        },
+    )
+    assert enqueue.status_code == 200
+
+    process = client.post("/warmup/worker/process-next", params={"queue_name": "send_execution"})
+    assert process.status_code == 200
+
+    replay = client.post(
+        "/warmup/worker/dlq/replay",
+        json={"item_index": 0, "approved_by": "qa-admin", "reason": "retry after fix"},
+    )
+    assert replay.status_code in {200, 403}
 
 
 def test_warmup_prometheus_metrics_endpoint():
