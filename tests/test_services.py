@@ -1,8 +1,21 @@
+import importlib.util
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
-from services.auth.app.main import app as auth_app
-from services.warmup-engine.app.main import app as warmup_app
-from services.verification-engine.app.main import app as verification_app
+
+def load_app(module_path: str):
+    spec = importlib.util.spec_from_file_location("service_module", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module.app
+
+
+ROOT = Path(__file__).resolve().parents[1]
+auth_app = load_app(str(ROOT / "services/auth/app/main.py"))
+warmup_app = load_app(str(ROOT / "services/warmup-engine/app/main.py"))
+verification_app = load_app(str(ROOT / "services/verification-engine/app/main.py"))
 
 
 def test_auth_signup_login_and_verify():
