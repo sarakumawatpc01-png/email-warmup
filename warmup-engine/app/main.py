@@ -60,6 +60,8 @@ REDIS_URL = os.getenv("REDIS_URL", "")
 OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
 PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "true").lower() == "true"
+DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev")
+SERVICE_NAME = "warmup-engine"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -126,29 +128,32 @@ PROVIDER_PROFILES: dict[str, dict[str, float]] = {
 PROM_HTTP_REQUESTS_TOTAL = Counter(
     "warmup_http_requests_total",
     "Total warmup-engine HTTP requests",
-    ["method", "path", "status_code"],
+    ["service", "env", "method", "path", "status_code"],
 )
 PROM_HTTP_REQUEST_DURATION_SECONDS = Histogram(
     "warmup_http_request_duration_seconds",
     "Warmup-engine HTTP request duration in seconds",
-    ["method", "path"],
+    ["service", "env", "method", "path"],
 )
 PROM_QUEUE_BACKLOG = Gauge(
     "warmup_queue_backlog",
     "Current warmup queue backlog depth",
-    ["queue_name", "backend"],
+    ["service", "env", "queue_name", "backend"],
 )
 PROM_SLO_SEND_SUCCESS_RATIO = Gauge(
     "warmup_slo_send_success_ratio",
     "SLO gauge for send success ratio",
+    ["service", "env", "provider"],
 )
 PROM_SLO_PLACEMENT_SCORE = Gauge(
     "warmup_slo_placement_score",
     "SLO gauge for inbox placement score",
+    ["service", "env", "provider"],
 )
 PROM_SLO_QUEUE_LATENCY_SECONDS = Gauge(
     "warmup_slo_queue_latency_seconds",
     "SLO gauge for queue latency proxy in seconds",
+    ["service", "env", "queue_name", "backend"],
 )
 
 
@@ -638,18 +643,23 @@ def refresh_slo_metrics() -> None:
     failed = METRICS.get("queue_dead_letter", 0)
     total = processed + failed
     send_success_ratio = (processed / total) if total else 1.0
-    PROM_SLO_SEND_SUCCESS_RATIO.set(send_success_ratio)
+    PROM_SLO_SEND_SUCCESS_RATIO.labels(service=SERVICE_NAME, env=DEPLOY_ENV, provider="all").set(send_success_ratio)
 
     placement_score = max(0.0, 1.0 - (METRICS.get("deliverability_spam_events", 0) / max(1, METRICS.get("deliverability_checks", 1))))
-    PROM_SLO_PLACEMENT_SCORE.set(placement_score)
+    PROM_SLO_PLACEMENT_SCORE.labels(service=SERVICE_NAME, env=DEPLOY_ENV, provider="all").set(placement_score)
 
     retry_events = METRICS.get("queue_retried", 0)
-    PROM_SLO_QUEUE_LATENCY_SECONDS.set(float(retry_events))
+    for queue_name in QUEUE_NAMES:
+        PROM_SLO_QUEUE_LATENCY_SECONDS.labels(
+            service=SERVICE_NAME, env=DEPLOY_ENV, queue_name=queue_name, backend="in-memory"
+        ).set(float(retry_events))
 
 
 def refresh_queue_backlog_metrics() -> None:
     for queue_name in QUEUE_NAMES:
-        PROM_QUEUE_BACKLOG.labels(queue_name=queue_name, backend="in-memory").set(len(IN_MEMORY_QUEUES[queue_name]))
+        PROM_QUEUE_BACKLOG.labels(
+            service=SERVICE_NAME, env=DEPLOY_ENV, queue_name=queue_name, backend="in-memory"
+        ).set(len(IN_MEMORY_QUEUES[queue_name]))
 
 
 def get_rq_queue(queue_name: str):
@@ -698,8 +708,12 @@ async def prometheus_http_middleware(request: Request, call_next):
         response = await call_next(request)
 
     elapsed = time.perf_counter() - start
-    PROM_HTTP_REQUEST_DURATION_SECONDS.labels(method=method, path=path).observe(elapsed)
-    PROM_HTTP_REQUESTS_TOTAL.labels(method=method, path=path, status_code=str(response.status_code)).inc()
+    PROM_HTTP_REQUEST_DURATION_SECONDS.labels(
+        service=SERVICE_NAME, env=DEPLOY_ENV, method=method, path=path
+    ).observe(elapsed)
+    PROM_HTTP_REQUESTS_TOTAL.labels(
+        service=SERVICE_NAME, env=DEPLOY_ENV, method=method, path=path, status_code=str(response.status_code)
+    ).inc()
     return response
 
 

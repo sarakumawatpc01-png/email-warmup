@@ -1,8 +1,26 @@
 import os
+import time
+import uuid
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+except Exception:  # pragma: no cover - optional runtime capability
+    trace = None
+    OTLPSpanExporter = None
+    FastAPIInstrumentor = None
+    Resource = None
+    TracerProvider = None
+    BatchSpanProcessor = None
+    ConsoleSpanExporter = None
 
 app = FastAPI(title="API Gateway", version="1.0.0")
 # localhost defaults: 80=nginx entrypoint, 5173=client app, 5174=superadmin app
@@ -31,6 +49,24 @@ TARGETS = {
     "crm": os.getenv("CRM_SERVICE_URL", "http://crm:8070"),
 }
 
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
+
+if trace and TracerProvider and BatchSpanProcessor:
+    resource = Resource.create({"service.name": "backend-gateway"}) if Resource else None
+    provider = TracerProvider(resource=resource)
+    if OTEL_EXPORTER_OTLP_ENDPOINT and OTLPSpanExporter:
+        provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{OTEL_EXPORTER_OTLP_ENDPOINT.rstrip('/')}/v1/traces"))
+        )
+    elif OTEL_ENABLE_CONSOLE_EXPORTER and ConsoleSpanExporter:
+        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    trace.set_tracer_provider(provider)
+    if FastAPIInstrumentor:
+        FastAPIInstrumentor.instrument_app(app)
+
+TRACER = trace.get_tracer("backend-gateway") if trace else None
+
 
 @app.get("/health")
 def health() -> dict:
@@ -41,6 +77,12 @@ async def proxy(request: Request, service: str, path: str) -> dict | str:
     base = TARGETS[service]
     url = f"{base}/{path}" if path else base
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    request_id = getattr(request.state, "request_id", request.headers.get("x-request-id", str(uuid.uuid4())))
+    headers["x-request-id"] = request_id
+    if request.headers.get("traceparent"):
+        headers["traceparent"] = request.headers["traceparent"]
+    if request.headers.get("tracestate"):
+        headers["tracestate"] = request.headers["tracestate"]
     body = await request.body()
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -59,6 +101,23 @@ async def proxy(request: Request, service: str, path: str) -> dict | str:
     if "application/json" in content_type:
         return response.json()
     return response.text
+
+
+@app.middleware("http")
+async def otel_gateway_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    request.state.request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    if TRACER:
+        with TRACER.start_as_current_span(f"gateway {request.method} {request.url.path}") as span:
+            span.set_attribute("http.method", request.method)
+            span.set_attribute("http.route", request.url.path)
+            response = await call_next(request)
+            span.set_attribute("http.status_code", response.status_code)
+    else:
+        response = await call_next(request)
+    response.headers["x-request-id"] = request.state.request_id
+    response.headers["x-gateway-latency-ms"] = str(round((time.perf_counter() - start) * 1000, 2))
+    return response
 
 
 @app.api_route("/auth/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

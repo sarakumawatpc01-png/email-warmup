@@ -3,6 +3,8 @@ import sys
 import uuid
 from pathlib import Path
 
+from hypothesis import given
+from hypothesis import strategies as st
 from fastapi.testclient import TestClient
 
 
@@ -280,3 +282,49 @@ def test_warmup_provider_profile_tuning_is_deterministic():
     body = tuned.json()
     assert body["mode"] in {"normal", "rescue", "throttle"}
     assert body["daily_target"] > 0
+
+
+@given(
+    requested_count=st.integers(min_value=1, max_value=80),
+    partner_pool=st.lists(
+        st.emails().map(str.lower),
+        min_size=0,
+        max_size=15,
+        unique=True,
+    ),
+)
+def test_warmup_schedule_property_invariants(requested_count, partner_pool):
+    client = TestClient(warmup_app)
+    mailbox = f"scheduler-{uuid.uuid4().hex[:8]}@example.com"
+
+    create = client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": "tenant-prop-schedule",
+            "mailbox": mailbox,
+            "domain_age_days": 45,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert create.status_code == 200
+
+    schedule = client.post(
+        "/warmup/schedule/generate",
+        json={
+            "tenant_id": "tenant-prop-schedule",
+            "mailbox": mailbox,
+            "partner_pool": partner_pool,
+            "requested_count": requested_count,
+        },
+    )
+    assert schedule.status_code == 200
+    body = schedule.json()
+    items = body["items"]
+
+    assert 1 <= len(items) <= requested_count
+    assert 0.0 <= body["entropy_score"] <= 1.0
+    assert all("send_at" in item and "partner" in item for item in items)
+    assert all("@" in item["partner"] for item in items)
+    send_ats = [item["send_at"] for item in items]
+    assert send_ats == sorted(send_ats)

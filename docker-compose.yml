@@ -130,6 +130,8 @@ services:
       CRM_SERVICE_URL: http://crm:8070
       BILLING_SERVICE_URL: http://billing_service:3001
       WHATSAPP_SERVICE_URL: http://whatsapp_service:3002
+      OTEL_ENABLE_CONSOLE_EXPORTER: "false"
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     depends_on:
       - auth
       - lead_service
@@ -146,6 +148,7 @@ services:
     environment:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
     ports:
       - "3001:3001"
     networks:
