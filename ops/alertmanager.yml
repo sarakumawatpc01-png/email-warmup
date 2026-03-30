@@ -1,0 +1,32 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: default-webhook
+  group_by: ["alertname", "service", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 2h
+  routes:
+    - matchers:
+        - severity="critical"
+      receiver: oncall-critical
+      repeat_interval: 30m
+    - matchers:
+        - severity="warning"
+      receiver: oncall-warning
+      repeat_interval: 2h
+
+receivers:
+  - name: default-webhook
+    webhook_configs:
+      - url: "http://oncall-webhook:8080/alerts/default"
+        send_resolved: true
+  - name: oncall-critical
+    webhook_configs:
+      - url: "http://oncall-webhook:8080/alerts/critical"
+        send_resolved: true
+  - name: oncall-warning
+    webhook_configs:
+      - url: "http://oncall-webhook:8080/alerts/warning"
+        send_resolved: true

@@ -1,0 +1,35 @@
+{
+  "title": "Warmup Engine Overview",
+  "timezone": "browser",
+  "version": 1,
+  "schemaVersion": 39,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "HTTP Request Rate",
+      "targets": [
+        {
+          "expr": "sum(rate(warmup_http_requests_total{service=\"warmup-engine\"}[5m])) by (status_code)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue Backlog",
+      "targets": [
+        {
+          "expr": "sum(warmup_queue_backlog{service=\"warmup-engine\"}) by (queue_name)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "SLO Send Success Ratio",
+      "targets": [
+        {
+          "expr": "warmup_slo_send_success_ratio{service=\"warmup-engine\",provider=\"all\"}"
+        }
+      ]
+    }
+  ]
+}

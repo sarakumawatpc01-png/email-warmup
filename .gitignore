@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+warmup.db
+
+node_modules/
+**/node_modules/
+
+.hypothesis/
+
+frontend/superadmin/src/dist/
