@@ -1,0 +1,153 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-email_saas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-email_saas}
+      POSTGRES_DB: ${POSTGRES_DB:-email_saas}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - app-net
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - app-net
+
+  auth:
+    build: ./services/auth
+    environment:
+      JWT_SECRET: ${JWT_SECRET:-dev-secret}
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+    ports:
+      - "8001:8001"
+    networks:
+      - app-net
+
+  lead-service:
+    build: ./services/lead-service
+    environment:
+      DATABASE_URL: postgresql+psycopg://email_saas:email_saas@postgres:5432/email_saas
+      JWT_SECRET: ${JWT_SECRET:-dev-secret}
+    depends_on:
+      - postgres
+    ports:
+      - "8002:8002"
+    networks:
+      - app-net
+
+  warmup-engine:
+    build: ./services/warmup-engine
+    ports:
+      - "8003:8003"
+    networks:
+      - app-net
+
+  verification-engine:
+    build: ./services/verification-engine
+    ports:
+      - "8004:8004"
+    networks:
+      - app-net
+
+  ai-agent:
+    build: ./services/ai-agent
+    ports:
+      - "8005:8005"
+    networks:
+      - app-net
+
+  gateway:
+    build: ./services/gateway
+    environment:
+      AUTH_SERVICE_URL: http://auth:8001
+      LEAD_SERVICE_URL: http://lead-service:8002
+      WARMUP_SERVICE_URL: http://warmup-engine:8003
+      VERIFICATION_SERVICE_URL: http://verification-engine:8004
+      AI_AGENT_SERVICE_URL: http://ai-agent:8005
+      CRM_SERVICE_URL: http://crm:8070
+      BILLING_SERVICE_URL: http://billing:3001
+      WHATSAPP_SERVICE_URL: http://whatsapp-service:3002
+    depends_on:
+      - auth
+      - lead-service
+      - warmup-engine
+      - verification-engine
+      - ai-agent
+    ports:
+      - "8000:8000"
+    networks:
+      - app-net
+
+  billing:
+    build: ./services/billing
+    environment:
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    ports:
+      - "3001:3001"
+    networks:
+      - app-net
+
+  whatsapp-service:
+    build: ./services/whatsapp-service
+    ports:
+      - "3002:3002"
+    networks:
+      - app-net
+
+  crm:
+    image: nginx:alpine
+    command: ["/bin/sh", "-c", "echo '<h1>Twenty CRM Integration Stub</h1>' > /usr/share/nginx/html/index.html && nginx -g 'daemon off;'"]
+    ports:
+      - "8070:80"
+    networks:
+      - app-net
+
+  mautic-client-template:
+    image: php:8.2-apache
+    command: ["/bin/sh", "-c", "echo '<?php echo \"Mautic client template\"; ?>' > /var/www/html/index.php && apache2-foreground"]
+    ports:
+      - "8081:80"
+    networks:
+      - app-net
+
+  frontend-client:
+    build: ./frontend/frontend-client
+    ports:
+      - "5173:80"
+    networks:
+      - app-net
+
+  frontend-admin:
+    build: ./frontend/frontend-admin
+    ports:
+      - "5174:80"
+    networks:
+      - app-net
+
+  nginx:
+    build: ./infra/nginx
+    depends_on:
+      - gateway
+      - frontend-client
+      - frontend-admin
+    ports:
+      - "80:80"
+    networks:
+      - app-net
+
+volumes:
+  pg_data:
+
+networks:
+  app-net:
+    driver: bridge
