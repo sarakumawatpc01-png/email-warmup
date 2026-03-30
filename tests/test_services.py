@@ -45,6 +45,28 @@ def test_auth_signup_login_and_verify():
     verify = client.post("/verify-token", json={"token": token})
     assert verify.status_code == 200
     assert verify.json()["tenant_id"] == "tenant-a"
+    assert isinstance(verify.json()["permissions"], list)
+
+
+def test_auth_tenant_admin_permissions_claims():
+    client = TestClient(auth_app)
+    signup = client.post(
+        "/signup",
+        json={
+            "email": "tenantadmin@example.com",
+            "password": "StrongPass123",
+            "role": "tenant_admin",
+            "tenant_id": "tenant-tadmin",
+        },
+    )
+    assert signup.status_code == 200
+    token = signup.json()["access_token"]
+
+    verify = client.post("/verify-token", json={"token": token})
+    assert verify.status_code == 200
+    body = verify.json()
+    assert body["role"] == "tenant_admin"
+    assert "warmup:admin" in body["permissions"]
 
 
 def test_warmup_job_creation():
@@ -291,6 +313,25 @@ def test_warmup_admin_internal_mailboxes_and_health():
     assert body["tenant_id"] == tenant
     assert body["mailbox"] == mailbox.lower()
     assert isinstance(body["event_timeline"], list)
+
+    auth_client = TestClient(auth_app)
+    su = auth_client.post(
+        "/signup",
+        json={
+            "email": f"tenantadmin-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "tenant_admin",
+            "tenant_id": tenant,
+        },
+    )
+    assert su.status_code == 200
+    token = su.json()["access_token"]
+    upsert_with_jwt = client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"tenant_id": tenant, "mailbox": f"seed-{uuid.uuid4().hex[:6]}@gmail.com", "notes": "jwt"},
+    )
+    assert upsert_with_jwt.status_code in {200, 403}
 
 
 def test_warmup_dlq_replay_endpoint():

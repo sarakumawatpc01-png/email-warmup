@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import jwt
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
@@ -63,6 +64,8 @@ PROMETHEUS_ENABLED = os.getenv("PROMETHEUS_ENABLED", "true").lower() == "true"
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev")
 SERVICE_NAME = "warmup-engine"
 ADMIN_API_KEY = os.getenv("WARMUP_ADMIN_API_KEY", "")
+AUTH_JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
+AUTH_JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -441,11 +444,44 @@ def json_log(event: str, **kwargs: Any) -> None:
     logger.info(json.dumps({"event": event, **kwargs}, default=str))
 
 
-def require_admin(api_key: str | None) -> None:
+def extract_token_claims(authorization: str | None) -> dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        claims = jwt.decode(token, AUTH_JWT_SECRET, algorithms=[AUTH_JWT_ALGORITHM])
+    except jwt.InvalidTokenError as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
+    return claims if isinstance(claims, dict) else {}
+
+
+def _has_permission(claims: dict[str, Any], permission: str) -> bool:
+    permissions = claims.get("permissions") or []
+    if not isinstance(permissions, list):
+        return False
+    return "*" in permissions or permission in permissions
+
+
+def require_admin(
+    api_key: str | None,
+    authorization: str | None = None,
+    *,
+    permission: str = "warmup:admin",
+    tenant_scope: str | None = None,
+) -> dict[str, Any]:
+    claims: dict[str, Any] = {}
+    if authorization:
+        claims = extract_token_claims(authorization)
+        if not _has_permission(claims, permission):
+            raise HTTPException(status_code=403, detail="Permission denied")
+        if tenant_scope and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_scope:
+            raise HTTPException(status_code=403, detail="Tenant scope denied")
+        return claims
     if not ADMIN_API_KEY:
-        return
+        return claims
     if not api_key or api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Admin API key required")
+    return claims
 
 
 def write_admin_audit_log(
@@ -1120,8 +1156,10 @@ def replay_dlq_task(
     payload: DlqReplayRequest,
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
+    authorization: str | None = Header(default=None),
 ) -> dict:
-    require_admin(x_admin_api_key)
+    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin")
+    actor = claims.get("sub") if claims else x_admin_actor
     if payload.item_index >= len(DEAD_LETTER_QUEUE):
         raise HTTPException(status_code=404, detail="DLQ item not found")
 
@@ -1140,7 +1178,7 @@ def replay_dlq_task(
     with Session(engine) as session:
         write_admin_audit_log(
             session,
-            actor=x_admin_actor,
+            actor=actor,
             action="dlq_replay",
             resource_type="warmup_event",
             resource_id=str(task.get("event_id", "")),
@@ -1323,9 +1361,12 @@ def set_kill_switch(
     payload: KillSwitchRequest,
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
+    authorization: str | None = Header(default=None),
 ) -> dict:
     global GLOBAL_KILL_SWITCH
-    require_admin(x_admin_api_key)
+    tenant_scope = payload.value if payload.scope == "tenant" else None
+    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin", tenant_scope=tenant_scope)
+    actor = claims.get("sub") if claims else x_admin_actor
 
     if payload.scope == "global":
         GLOBAL_KILL_SWITCH = payload.enabled
@@ -1348,7 +1389,7 @@ def set_kill_switch(
     with Session(engine) as session:
         write_admin_audit_log(
             session,
-            actor=x_admin_actor,
+            actor=actor,
             action="kill_switch_update",
             resource_type="kill_switch",
             resource_id=payload.scope,
@@ -1369,8 +1410,10 @@ def upsert_internal_mailbox(
     payload: InternalMailboxRequest,
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
+    authorization: str | None = Header(default=None),
 ) -> dict:
-    require_admin(x_admin_api_key)
+    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin", tenant_scope=payload.tenant_id)
+    actor = claims.get("sub") if claims else x_admin_actor
     mailbox = payload.mailbox.lower()
     provider = provider_from_mailbox(mailbox)
     with Session(engine) as session:
@@ -1390,7 +1433,7 @@ def upsert_internal_mailbox(
             item.is_active = True
         write_admin_audit_log(
             session,
-            actor=x_admin_actor,
+            actor=actor,
             action="internal_mailbox_upsert",
             resource_type="internal_mailbox",
             resource_id=f"{payload.tenant_id}:{mailbox}",

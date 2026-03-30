@@ -24,7 +24,7 @@ reset_otps: Dict[str, dict] = {}
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=8)
-    role: str = Field(pattern="^(superadmin|client)$")
+    role: str = Field(pattern="^(superadmin|tenant_admin|client)$")
     tenant_id: str = Field(min_length=2, max_length=64)
 
 
@@ -52,11 +52,17 @@ def hash_password(password: str, salt: str) -> str:
 
 
 def issue_token(email: str, role: str, tenant_id: str) -> str:
+    role_permissions = {
+        "superadmin": ["*"],
+        "tenant_admin": ["warmup:admin", "warmup:read", "billing:manage_providers", "billing:read_providers"],
+        "client": ["warmup:read", "billing:read_providers"],
+    }
     now = datetime.now(timezone.utc)
     payload = {
         "sub": email,
         "role": role,
         "tenant_id": tenant_id,
+        "permissions": role_permissions.get(role, []),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp()),
     }
@@ -147,4 +153,5 @@ def verify_token(payload: VerifyRequest) -> dict:
         "email": claims.get("sub"),
         "role": claims.get("role"),
         "tenant_id": claims.get("tenant_id"),
+        "permissions": claims.get("permissions", []),
     }

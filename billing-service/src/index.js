@@ -1,7 +1,10 @@
 import express from 'express';
 import Stripe from 'stripe';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
 import { context, propagation, trace } from '@opentelemetry/api';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
@@ -21,8 +24,12 @@ const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = stripeSecret ? new Stripe(stripeSecret) : null;
 const billingAdminApiKey = process.env.BILLING_ADMIN_API_KEY || '';
+const authJwtSecret = process.env.JWT_SECRET || 'dev-secret';
+const authJwtAlgorithm = process.env.JWT_ALGORITHM || 'HS256';
+const providerConfigPath = process.env.BILLING_PROVIDER_CONFIG_PATH || path.resolve('data/payment-providers.enc');
+const providerConfigEncKey = process.env.BILLING_CONFIG_ENC_KEY || '';
 
-const paymentProviders = {
+let paymentProviders = {
   stripe: {
     enabled: Boolean(stripeSecret),
     key_id: process.env.STRIPE_PUBLISHABLE_KEY || '',
@@ -53,11 +60,131 @@ const paymentProviders = {
   },
 };
 
+function normalizeConfig(config) {
+  return {
+    stripe: {
+      enabled: Boolean(config?.stripe?.enabled),
+      key_id: config?.stripe?.key_id || '',
+      secret_set: Boolean(config?.stripe?.secret_set),
+      webhook_secret_set: Boolean(config?.stripe?.webhook_secret_set),
+      mode: config?.stripe?.mode || 'test',
+    },
+    razorpay: {
+      enabled: Boolean(config?.razorpay?.enabled),
+      key_id: config?.razorpay?.key_id || '',
+      secret_set: Boolean(config?.razorpay?.secret_set),
+      webhook_secret_set: Boolean(config?.razorpay?.webhook_secret_set),
+      mode: config?.razorpay?.mode || 'test',
+    },
+    phonepe: {
+      enabled: Boolean(config?.phonepe?.enabled),
+      merchant_id: config?.phonepe?.merchant_id || '',
+      secret_set: Boolean(config?.phonepe?.secret_set),
+      webhook_secret_set: Boolean(config?.phonepe?.webhook_secret_set),
+      mode: config?.phonepe?.mode || 'test',
+    },
+    paytm: {
+      enabled: Boolean(config?.paytm?.enabled),
+      merchant_id: config?.paytm?.merchant_id || '',
+      secret_set: Boolean(config?.paytm?.secret_set),
+      webhook_secret_set: Boolean(config?.paytm?.webhook_secret_set),
+      mode: config?.paytm?.mode || 'test',
+    },
+  };
+}
+
+function encryptionKey() {
+  if (!providerConfigEncKey) {
+    return null;
+  }
+  return crypto.createHash('sha256').update(providerConfigEncKey).digest();
+}
+
+function saveProviderConfig() {
+  const key = encryptionKey();
+  fs.mkdirSync(path.dirname(providerConfigPath), { recursive: true });
+  const payload = Buffer.from(JSON.stringify(paymentProviders));
+  if (!key) {
+    fs.writeFileSync(providerConfigPath, payload);
+    return;
+  }
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(payload), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  fs.writeFileSync(
+    providerConfigPath,
+    JSON.stringify({
+      v: 1,
+      iv: iv.toString('base64'),
+      tag: tag.toString('base64'),
+      data: encrypted.toString('base64'),
+    })
+  );
+}
+
+function loadProviderConfig() {
+  if (!fs.existsSync(providerConfigPath)) {
+    return;
+  }
+  const raw = fs.readFileSync(providerConfigPath, 'utf8').trim();
+  if (!raw) {
+    return;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed?.iv || !parsed?.tag || !parsed?.data) {
+      paymentProviders = normalizeConfig(parsed);
+      return;
+    }
+    const key = encryptionKey();
+    if (!key) {
+      return;
+    }
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parsed.iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
+    const decrypted = Buffer.concat([decipher.update(Buffer.from(parsed.data, 'base64')), decipher.final()]);
+    paymentProviders = normalizeConfig(JSON.parse(decrypted.toString('utf8')));
+  } catch (error) {
+    console.error('failed to load payment provider config');
+  }
+}
+
+loadProviderConfig();
+
 function verifyAdmin(req) {
-  if (!billingAdminApiKey) {
+  if (billingAdminApiKey && req.headers['x-admin-api-key'] === billingAdminApiKey) {
     return true;
   }
-  return req.headers['x-admin-api-key'] === billingAdminApiKey;
+  const authorization = req.headers.authorization;
+  if (!authorization || !authorization.startsWith('Bearer ')) {
+    return false;
+  }
+  try {
+    const claims = jwt.verify(authorization.slice(7), authJwtSecret, { algorithms: [authJwtAlgorithm] });
+    const permissions = claims.permissions || [];
+    return Array.isArray(permissions) && (permissions.includes('*') || permissions.includes('billing:manage_providers'));
+  } catch (error) {
+    return false;
+  }
+}
+
+function canReadProviders(req) {
+  if (billingAdminApiKey && req.headers['x-admin-api-key'] === billingAdminApiKey) {
+    return true;
+  }
+  const authorization = req.headers.authorization;
+  if (!authorization || !authorization.startsWith('Bearer ')) {
+    return false;
+  }
+  try {
+    const claims = jwt.verify(authorization.slice(7), authJwtSecret, { algorithms: [authJwtAlgorithm] });
+    const permissions = claims.permissions || [];
+    return Array.isArray(permissions)
+      && (permissions.includes('*') || permissions.includes('billing:manage_providers') || permissions.includes('billing:read_providers'));
+  } catch (error) {
+    return false;
+  }
 }
 
 function auditLog(event, details = {}) {
@@ -194,15 +321,15 @@ app.post('/subscriptions/preview', async (req, res) => {
 });
 
 app.get('/admin/payments/providers', adminReadLimiter, (req, res) => {
-  if (!verifyAdmin(req)) {
-    return res.status(403).json({ error: 'Admin API key required' });
+  if (!canReadProviders(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
   }
   return res.json({ providers: paymentProviders });
 });
 
 app.post('/admin/payments/providers/:provider/setup', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
-    return res.status(403).json({ error: 'Admin API key required' });
+    return res.status(403).json({ error: 'Unauthorized' });
   }
   const provider = req.params.provider;
   if (!paymentProviders[provider]) {
@@ -230,6 +357,7 @@ app.post('/admin/payments/providers/:provider/setup', adminWriteLimiter, (req, r
     paymentProviders.paytm.webhook_secret_set = Boolean(config.webhook_secret || paymentProviders.paytm.webhook_secret_set);
     paymentProviders.paytm.enabled = Boolean(paymentProviders.paytm.merchant_id && paymentProviders.paytm.secret_set);
   }
+  saveProviderConfig();
   auditLog('payment_provider_setup', { provider, actor: req.headers['x-admin-actor'] || 'unknown' });
   return res.json({ provider, config: paymentProviders[provider] });
 });

@@ -151,6 +151,8 @@ services:
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       BILLING_ADMIN_API_KEY: ${BILLING_ADMIN_API_KEY:-}
+      BILLING_PROVIDER_CONFIG_PATH: ${BILLING_PROVIDER_CONFIG_PATH:-/app/data/payment-providers.enc}
+      BILLING_CONFIG_ENC_KEY: ${BILLING_CONFIG_ENC_KEY:-}
       RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
       RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
       RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
@@ -160,6 +162,8 @@ services:
       PAYTM_MERCHANT_ID: ${PAYTM_MERCHANT_ID:-}
       PAYTM_MERCHANT_KEY: ${PAYTM_MERCHANT_KEY:-}
       PAYTM_WEBHOOK_SECRET: ${PAYTM_WEBHOOK_SECRET:-}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
     ports:
       - "3001:3001"
     networks:
@@ -181,6 +185,7 @@ services:
     command: ["--config.file=/etc/prometheus/prometheus.yml"]
     volumes:
       - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/alerts:/etc/prometheus/alerts:ro
     ports:
       - "9090:9090"
     networks:

@@ -91,6 +91,7 @@ const html = `<!doctype html>
         'Content-Type': 'application/json',
         'x-admin-api-key': localStorage.getItem('superadmin_api_key') || '',
         'x-admin-actor': localStorage.getItem('superadmin_actor') || 'superadmin-ui',
+        'Authorization': localStorage.getItem('superadmin_auth_token') ? ('Bearer ' + localStorage.getItem('superadmin_auth_token')) : '',
       };
       const q = (id) => document.getElementById(id);
       function show(tab) {
