@@ -57,6 +57,8 @@ class LeadOut(BaseModel):
     first_name: Optional[str]
     last_name: Optional[str]
 
+    model_config = {"from_attributes": True}
+
 
 def parse_token(authorization: str = Header(default="")) -> dict:
     if not authorization.startswith("Bearer "):
@@ -97,17 +99,7 @@ def create_lead(payload: LeadCreate, claims: dict = Depends(parse_token)) -> Lea
         session.add(lead)
         session.commit()
         session.refresh(lead)
-        return LeadOut.model_validate(
-            {
-                "id": lead.id,
-                "tenant_id": lead.tenant_id,
-                "email": lead.email,
-                "company": lead.company,
-                "job_title": lead.job_title,
-                "first_name": lead.first_name,
-                "last_name": lead.last_name,
-            }
-        )
+        return LeadOut.model_validate(lead)
 
 
 @app.get("/leads")
@@ -157,15 +149,39 @@ def list_leads(
 
 @app.post("/leads/bulk")
 def bulk_create(items: list[LeadCreate], claims: dict = Depends(parse_token)) -> dict:
+    tenant_id = claims["tenant_id"]
+    normalized_emails = [item.email.lower() for item in items]
+    unique_emails = list(dict.fromkeys(normalized_emails))
     created = 0
     rejected = 0
-    for item in items:
-        try:
-            create_lead(item, claims)
-            created += 1
-        except HTTPException as exc:
-            if exc.status_code == 409:
+
+    with Session(engine) as session:
+        existing_emails = set(
+            session.scalars(
+                select(Lead.email).where(Lead.tenant_id == tenant_id, Lead.email.in_(unique_emails))
+            )
+        )
+        seen_new = set()
+        to_create = []
+        for item in items:
+            email = item.email.lower()
+            if email in existing_emails or email in seen_new:
                 rejected += 1
-            else:
-                raise
+                continue
+            seen_new.add(email)
+            to_create.append(
+                Lead(
+                    tenant_id=tenant_id,
+                    email=email,
+                    company=item.company,
+                    job_title=item.job_title,
+                    first_name=item.first_name,
+                    last_name=item.last_name,
+                )
+            )
+
+        if to_create:
+            session.add_all(to_create)
+            session.commit()
+            created = len(to_create)
     return {"created": created, "rejected": rejected}
