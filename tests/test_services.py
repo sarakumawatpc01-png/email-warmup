@@ -377,22 +377,17 @@ def test_warmup_visibility_timeout_sweeper_and_lease_renew():
     assert enqueue.status_code == 200
     event_id = enqueue.json()["event_id"]
 
-    inflight_key = f"send_execution:{event_id}"
     inflight_route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/worker/inflight")
     warmup_state = inflight_route.endpoint.__globals__
-    warmup_state["IN_MEMORY_INFLIGHT"][inflight_key] = {
-        "task": {
-            "event_id": event_id,
-            "queue_name": "send_execution",
-            "attempt": 1,
-            "max_attempts": 2,
-            "idempotency_key": key,
-            "tenant_id": "tenant-lease",
-            "mailbox": "lease@example.com",
-        },
-        "queue_name": "send_execution",
-        "lease_until": warmup_state["utc_now"]() - warmup_state["timedelta"](seconds=5),
-    }
+    with warmup_state["Session"](warmup_state["engine"]) as session:
+        session.add(
+            warmup_state["WorkerLease"](
+                event_id=event_id,
+                queue_name="send_execution",
+                lease_until=warmup_state["utc_now"]() - warmup_state["timedelta"](seconds=5),
+            )
+        )
+        session.commit()
 
     sweep = client.post("/warmup/worker/sweep-stuck")
     assert sweep.status_code in {200, 403}
@@ -535,11 +530,12 @@ _MAILBOX_STRATEGY = st.builds(
 def test_warmup_schedule_property_invariants(requested_count, partner_pool):
     client = TestClient(warmup_app)
     mailbox = f"scheduler-{uuid.uuid4().hex[:8]}@example.com"
+    tenant_id = f"tenant-prop-schedule-{uuid.uuid4().hex[:8]}"
 
     create = client.post(
         "/warmup/jobs",
         json={
-            "tenant_id": "tenant-prop-schedule",
+            "tenant_id": tenant_id,
             "mailbox": mailbox,
             "domain_age_days": 45,
             "blacklist_detected": False,
@@ -551,7 +547,7 @@ def test_warmup_schedule_property_invariants(requested_count, partner_pool):
     schedule = client.post(
         "/warmup/schedule/generate",
         json={
-            "tenant_id": "tenant-prop-schedule",
+            "tenant_id": tenant_id,
             "mailbox": mailbox,
             "partner_pool": partner_pool,
             "requested_count": requested_count,

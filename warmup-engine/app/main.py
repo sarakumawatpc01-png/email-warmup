@@ -1214,21 +1214,20 @@ def enqueue_task(payload: QueueTaskRequest) -> dict:
             payload=json.dumps({**payload.payload, "max_attempts": payload.max_attempts}),
         )
         session.add(event)
+        session.flush()
+        ensure_outbox_event(
+            session,
+            topic="warmup.queue.enqueue",
+            dedupe_key=f"warmup-event:{event.id}",
+            payload={
+                "event_id": event.id,
+                "tenant_id": payload.tenant_id,
+                "mailbox": payload.mailbox.lower(),
+                "queue_name": payload.queue_name,
+                "idempotency_key": payload.idempotency_key,
+            },
+        )
         session.commit()
-        with Session(engine) as outbox_session:
-            ensure_outbox_event(
-                outbox_session,
-                topic="warmup.queue.enqueue",
-                dedupe_key=f"warmup-event:{event.id}",
-                payload={
-                    "event_id": event.id,
-                    "tenant_id": payload.tenant_id,
-                    "mailbox": payload.mailbox.lower(),
-                    "queue_name": payload.queue_name,
-                    "idempotency_key": payload.idempotency_key,
-                },
-            )
-            outbox_session.commit()
 
         queue_payload = {
             "event_id": event.id,

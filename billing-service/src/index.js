@@ -419,7 +419,7 @@ app.post('/webhooks/razorpay', webhookLimiter, express.raw({ type: 'application/
   if (!verifyHmac(req.body, signature, secret)) {
     return res.status(400).json({ error: 'Invalid Razorpay webhook signature' });
   }
-  const eventId = extractBodyEventId('razorpay', req.body) || sha256(Buffer.concat([req.body, Buffer.from(String(signature || ''))]));
+  const eventId = extractBodyEventId('razorpay', req.body) || sha256(req.body);
   const ledger = recordWebhookLedger({
     provider: 'razorpay',
     eventId,
@@ -441,7 +441,7 @@ app.post('/webhooks/phonepe', webhookLimiter, express.raw({ type: 'application/j
   if (!verifyHmac(req.body, signature, secret)) {
     return res.status(400).json({ error: 'Invalid PhonePe webhook signature' });
   }
-  const eventId = extractBodyEventId('phonepe', req.body) || sha256(Buffer.concat([req.body, Buffer.from(String(signature || ''))]));
+  const eventId = extractBodyEventId('phonepe', req.body) || sha256(req.body);
   const ledger = recordWebhookLedger({
     provider: 'phonepe',
     eventId,
@@ -463,7 +463,7 @@ app.post('/webhooks/paytm', webhookLimiter, express.raw({ type: 'application/jso
   if (!verifyHmac(req.body, signature, secret)) {
     return res.status(400).json({ error: 'Invalid Paytm webhook signature' });
   }
-  const eventId = extractBodyEventId('paytm', req.body) || sha256(Buffer.concat([req.body, Buffer.from(String(signature || ''))]));
+  const eventId = extractBodyEventId('paytm', req.body) || sha256(req.body);
   const ledger = recordWebhookLedger({
     provider: 'paytm',
     eventId,
