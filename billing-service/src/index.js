@@ -28,6 +28,13 @@ const authJwtSecret = process.env.JWT_SECRET || 'dev-secret';
 const authJwtAlgorithm = process.env.JWT_ALGORITHM || 'HS256';
 const providerConfigPath = process.env.BILLING_PROVIDER_CONFIG_PATH || path.resolve('data/payment-providers.enc');
 const providerConfigEncKey = process.env.BILLING_CONFIG_ENC_KEY || '';
+const providerSecretBackend = (process.env.BILLING_SECRET_BACKEND || 'file').toLowerCase();
+const vaultAddr = process.env.VAULT_ADDR || '';
+const vaultToken = process.env.VAULT_TOKEN || '';
+const vaultKvPath = process.env.VAULT_PAYMENT_CONFIG_PATH || 'secret/data/email-warmup/billing/providers';
+const kmsEncryptUrl = process.env.KMS_ENCRYPT_URL || '';
+const kmsDecryptUrl = process.env.KMS_DECRYPT_URL || '';
+const kmsAuthToken = process.env.KMS_AUTH_TOKEN || '';
 
 let paymentProviders = {
   stripe: {
@@ -100,10 +107,58 @@ function encryptionKey() {
   return crypto.createHash('sha256').update(providerConfigEncKey).digest();
 }
 
-function saveProviderConfig() {
+async function callSecretApi(url, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (kmsAuthToken) {
+    headers.Authorization = `Bearer ${kmsAuthToken}`;
+  }
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`secret API call failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+async function saveProviderConfig() {
   const key = encryptionKey();
   fs.mkdirSync(path.dirname(providerConfigPath), { recursive: true });
   const payload = Buffer.from(JSON.stringify(paymentProviders));
+  if (providerSecretBackend === 'vault') {
+    if (!vaultAddr || !vaultToken) {
+      throw new Error('vault backend configured but VAULT_ADDR/VAULT_TOKEN missing');
+    }
+    const response = await fetch(`${vaultAddr.replace(/\/$/, '')}/v1/${vaultKvPath}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Vault-Token': vaultToken,
+      },
+      body: JSON.stringify({ data: { providers: paymentProviders } }),
+    });
+    if (!response.ok) {
+      throw new Error(`vault write failed: ${response.status}`);
+    }
+    return;
+  }
+  if (providerSecretBackend === 'kms') {
+    if (!kmsEncryptUrl || !kmsDecryptUrl) {
+      throw new Error('kms backend configured but KMS_ENCRYPT_URL/KMS_DECRYPT_URL missing');
+    }
+    const encrypted = await callSecretApi(kmsEncryptUrl, { plaintext: payload.toString('base64') });
+    fs.writeFileSync(
+      providerConfigPath,
+      JSON.stringify({
+        v: 2,
+        backend: 'kms',
+        ciphertext: encrypted.ciphertext || '',
+      })
+    );
+    return;
+  }
   if (!key) {
     fs.writeFileSync(providerConfigPath, payload);
     return;
@@ -123,7 +178,26 @@ function saveProviderConfig() {
   );
 }
 
-function loadProviderConfig() {
+async function loadProviderConfig() {
+  if (providerSecretBackend === 'vault') {
+    if (!vaultAddr || !vaultToken) {
+      return;
+    }
+    try {
+      const response = await fetch(`${vaultAddr.replace(/\/$/, '')}/v1/${vaultKvPath}`, {
+        method: 'GET',
+        headers: { 'X-Vault-Token': vaultToken },
+      });
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+      paymentProviders = normalizeConfig(data?.data?.data?.providers || {});
+    } catch (_error) {
+      console.error('failed to load payment provider config from vault');
+    }
+    return;
+  }
   if (!fs.existsSync(providerConfigPath)) {
     return;
   }
@@ -133,6 +207,15 @@ function loadProviderConfig() {
   }
   try {
     const parsed = JSON.parse(raw);
+    if (parsed?.backend === 'kms' && parsed?.ciphertext) {
+      if (!kmsDecryptUrl) {
+        return;
+      }
+      const decrypted = await callSecretApi(kmsDecryptUrl, { ciphertext: parsed.ciphertext });
+      const clear = Buffer.from(decrypted.plaintext || '', 'base64').toString('utf8');
+      paymentProviders = normalizeConfig(JSON.parse(clear));
+      return;
+    }
     if (!parsed?.iv || !parsed?.tag || !parsed?.data) {
       paymentProviders = normalizeConfig(parsed);
       return;
@@ -149,8 +232,6 @@ function loadProviderConfig() {
     console.error('failed to load payment provider config');
   }
 }
-
-loadProviderConfig();
 
 function verifyAdmin(req) {
   if (billingAdminApiKey && req.headers['x-admin-api-key'] === billingAdminApiKey) {
@@ -321,13 +402,18 @@ app.post('/subscriptions/preview', async (req, res) => {
 });
 
 app.get('/admin/payments/providers', adminReadLimiter, (req, res) => {
-  if (!canReadProviders(req)) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-  return res.json({ providers: paymentProviders });
+  Promise.resolve()
+    .then(() => loadProviderConfig())
+    .then(() => {
+      if (!canReadProviders(req)) {
+        return res.status(403).json({ error: 'Unauthorized' });
+      }
+      return res.json({ providers: paymentProviders });
+    })
+    .catch(() => res.status(500).json({ error: 'Provider config read failed' }));
 });
 
-app.post('/admin/payments/providers/:provider/setup', adminWriteLimiter, (req, res) => {
+app.post('/admin/payments/providers/:provider/setup', adminWriteLimiter, async (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
@@ -357,7 +443,11 @@ app.post('/admin/payments/providers/:provider/setup', adminWriteLimiter, (req, r
     paymentProviders.paytm.webhook_secret_set = Boolean(config.webhook_secret || paymentProviders.paytm.webhook_secret_set);
     paymentProviders.paytm.enabled = Boolean(paymentProviders.paytm.merchant_id && paymentProviders.paytm.secret_set);
   }
-  saveProviderConfig();
+  try {
+    await saveProviderConfig();
+  } catch (_error) {
+    return res.status(500).json({ error: 'Provider config write failed' });
+  }
   auditLog('payment_provider_setup', { provider, actor: req.headers['x-admin-actor'] || 'unknown' });
   return res.json({ provider, config: paymentProviders[provider] });
 });
@@ -367,6 +457,8 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-app.listen(3001, () => {
-  console.log('billing listening on 3001');
+loadProviderConfig().finally(() => {
+  app.listen(3001, () => {
+    console.log('billing listening on 3001');
+  });
 });

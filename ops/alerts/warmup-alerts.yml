@@ -21,6 +21,26 @@ groups:
           summary: "Warmup send success ratio degraded"
           description: "Global send success ratio is below 0.90 for 15m."
 
+      - alert: WarmupSendSuccessRatioBurnRateFast
+        expr: warmup_slo_send_success_ratio{service="warmup-engine",provider="all"} < 0.80
+        for: 5m
+        labels:
+          severity: critical
+          service: warmup-engine
+        annotations:
+          summary: "Warmup SLO fast burn-rate breach"
+          description: "Send success ratio dropped below 0.80 over a short window."
+
+      - alert: WarmupSendSuccessRatioBurnRateSlow
+        expr: warmup_slo_send_success_ratio{service="warmup-engine",provider="all"} < 0.92
+        for: 1h
+        labels:
+          severity: warning
+          service: warmup-engine
+        annotations:
+          summary: "Warmup SLO slow burn-rate breach"
+          description: "Send success ratio below 0.92 for 1 hour."
+
       - alert: WarmupPlacementScoreLow
         expr: warmup_slo_placement_score{service="warmup-engine",provider="all"} < 0.75
         for: 20m

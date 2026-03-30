@@ -360,6 +360,80 @@ def test_warmup_dlq_replay_endpoint():
     assert replay.status_code in {200, 403}
 
 
+def test_warmup_visibility_timeout_sweeper_and_lease_renew():
+    client = TestClient(warmup_app)
+    key = f"lease-{uuid.uuid4().hex[:16]}"
+    enqueue = client.post(
+        "/warmup/worker/enqueue",
+        json={
+            "tenant_id": "tenant-lease",
+            "mailbox": "lease@example.com",
+            "queue_name": "send_execution",
+            "idempotency_key": key,
+            "payload": {"force_fail": False},
+            "max_attempts": 2,
+        },
+    )
+    assert enqueue.status_code == 200
+    event_id = enqueue.json()["event_id"]
+
+    inflight_key = f"send_execution:{event_id}"
+    warmup_module = sys.modules[warmup_app.__module__]
+    warmup_module.IN_MEMORY_INFLIGHT[inflight_key] = {
+        "task": {
+            "event_id": event_id,
+            "queue_name": "send_execution",
+            "attempt": 1,
+            "max_attempts": 2,
+            "idempotency_key": key,
+            "tenant_id": "tenant-lease",
+            "mailbox": "lease@example.com",
+        },
+        "queue_name": "send_execution",
+        "lease_until": warmup_module.utc_now() - warmup_module.timedelta(seconds=5),
+    }
+
+    sweep = client.post("/warmup/worker/sweep-stuck")
+    assert sweep.status_code in {200, 403}
+
+    if sweep.status_code == 200:
+        assert sweep.json()["swept"] is True
+        assert sweep.json()["requeued"] >= 1
+
+    renew = client.post(
+        "/warmup/worker/lease/renew",
+        json={"event_id": event_id, "queue_name": "send_execution", "extend_seconds": 30},
+    )
+    assert renew.status_code in {200, 404}
+
+
+def test_warmup_admin_tenant_scope_denied_for_tenant_admin():
+    warmup_client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
+    signup = auth_client.post(
+        "/signup",
+        json={
+            "email": f"tenantadmin-scope-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "tenant_admin",
+            "tenant_id": "tenant-scope-a",
+        },
+    )
+    assert signup.status_code == 200
+    token = signup.json()["access_token"]
+
+    denied = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "tenant_id": "tenant-scope-b",
+            "mailbox": f"seed-{uuid.uuid4().hex[:6]}@gmail.com",
+            "notes": "scope-check",
+        },
+    )
+    assert denied.status_code == 403
+
+
 def test_warmup_prometheus_metrics_endpoint():
     client = TestClient(warmup_app)
     response = client.get("/metrics/prometheus")

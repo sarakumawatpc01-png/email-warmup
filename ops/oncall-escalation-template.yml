@@ -1,0 +1,30 @@
+escalation_policy:
+  name: warmup-prod-oncall
+  levels:
+    - level: 1
+      trigger: critical
+      notify:
+        - channel: pager
+          target: oncall-primary
+        - channel: slack
+          target: "#warmup-alerts"
+      ack_timeout_minutes: 10
+    - level: 2
+      trigger: critical_unacked
+      notify:
+        - channel: pager
+          target: oncall-secondary
+        - channel: email
+          target: sre-managers@example.com
+      escalation_after_minutes: 15
+    - level: 3
+      trigger: sev1_or_long_outage
+      notify:
+        - channel: phone
+          target: incident-commander
+      escalation_after_minutes: 30
+  warning_policy:
+    notify:
+      - channel: slack
+        target: "#warmup-warnings"
+    digest_minutes: 30

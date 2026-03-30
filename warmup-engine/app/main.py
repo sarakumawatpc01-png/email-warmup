@@ -76,9 +76,11 @@ if not logger.handlers:
 METRICS: dict[str, int] = defaultdict(int)
 IN_MEMORY_QUEUES: dict[str, deque] = defaultdict(deque)
 DEAD_LETTER_QUEUE: deque = deque(maxlen=1000)
+IN_MEMORY_INFLIGHT: dict[str, dict[str, Any]] = {}
 GLOBAL_KILL_SWITCH = False
 TENANT_KILL_SWITCHES: set[str] = set()
 PROVIDER_KILL_SWITCHES: set[str] = set()
+QUEUE_VISIBILITY_TIMEOUT_SECONDS = int(os.getenv("WARMUP_QUEUE_VISIBILITY_TIMEOUT_SECONDS", "45"))
 
 QUEUE_NAMES = {"schedule_generation", "send_execution", "reply_simulation", "reputation_scoring"}
 
@@ -416,6 +418,12 @@ class DlqReplayRequest(BaseModel):
     item_index: int = Field(ge=0)
     approved_by: str = Field(min_length=2, max_length=120)
     reason: str = Field(min_length=3, max_length=255)
+
+
+class LeaseRenewRequest(BaseModel):
+    event_id: int = Field(ge=1)
+    queue_name: Literal["schedule_generation", "send_execution", "reply_simulation", "reputation_scoring"]
+    extend_seconds: int = Field(default=30, ge=5, le=300)
 
 
 def provider_profile_for_mailbox(mailbox: str) -> dict[str, float]:
@@ -771,6 +779,51 @@ def refresh_queue_backlog_metrics() -> None:
         ).set(len(IN_MEMORY_QUEUES[queue_name]))
 
 
+def _event_key(queue_name: str, event_id: Any) -> str:
+    return f"{queue_name}:{event_id}"
+
+
+def sweep_stuck_inflight_tasks() -> dict[str, int]:
+    now = utc_now()
+    moved = 0
+    dead_lettered = 0
+    with Session(engine) as session:
+        for key, item in list(IN_MEMORY_INFLIGHT.items()):
+            lease_until = item.get("lease_until")
+            if not isinstance(lease_until, datetime) or lease_until > now:
+                continue
+            task = dict(item.get("task") or {})
+            queue_name = item.get("queue_name")
+            if queue_name not in QUEUE_NAMES:
+                IN_MEMORY_INFLIGHT.pop(key, None)
+                continue
+            attempts = int(task.get("attempt", 1))
+            max_attempts = int(task.get("max_attempts", 4))
+            event_id = task.get("event_id")
+            event = session.get(WarmupEvent, event_id) if event_id else None
+            if attempts >= max_attempts:
+                DEAD_LETTER_QUEUE.append({"task": task, "error": "lease_timeout", "failed_at": now.isoformat()})
+                if event:
+                    event.status = "dead_letter"
+                    event.outcome = "failed"
+                METRICS["queue_dead_letter"] += 1
+                dead_lettered += 1
+            else:
+                task["attempt"] = attempts + 1
+                task["retry_backoff_seconds"] = min(60, 2 ** attempts)
+                IN_MEMORY_QUEUES[queue_name].append(task)
+                if event:
+                    event.retry_count += 1
+                    event.status = "retrying"
+                METRICS["queue_retried"] += 1
+                moved += 1
+            IN_MEMORY_INFLIGHT.pop(key, None)
+        session.commit()
+    refresh_slo_metrics()
+    refresh_queue_backlog_metrics()
+    return {"requeued": moved, "dead_lettered": dead_lettered}
+
+
 def get_rq_queue(queue_name: str):
     if not (REDIS_URL and Redis and Queue):
         return None
@@ -790,7 +843,11 @@ def health() -> dict:
 
 @app.get("/metrics")
 def metrics() -> dict:
-    return {"counters": dict(METRICS), "dead_letter_queue_size": len(DEAD_LETTER_QUEUE)}
+    return {
+        "counters": dict(METRICS),
+        "dead_letter_queue_size": len(DEAD_LETTER_QUEUE),
+        "inflight_queue_size": len(IN_MEMORY_INFLIGHT),
+    }
 
 
 @app.get("/metrics/prometheus")
@@ -1083,6 +1140,7 @@ def enqueue_task(payload: QueueTaskRequest) -> dict:
 def process_next(queue_name: str = "send_execution") -> dict:
     if queue_name not in QUEUE_NAMES:
         raise HTTPException(status_code=400, detail="Invalid queue name")
+    sweep_stuck_inflight_tasks()
 
     rq_queue = get_rq_queue(queue_name)
     if rq_queue is not None:
@@ -1098,9 +1156,13 @@ def process_next(queue_name: str = "send_execution") -> dict:
         return {"processed": 0, "backend": "in-memory"}
 
     task = IN_MEMORY_QUEUES[queue_name].popleft()
+    lease_until = utc_now() + timedelta(seconds=QUEUE_VISIBILITY_TIMEOUT_SECONDS)
+    inflight_key = _event_key(queue_name, task.get("event_id"))
+    IN_MEMORY_INFLIGHT[inflight_key] = {"task": dict(task), "queue_name": queue_name, "lease_until": lease_until}
     with Session(engine) as session:
         event = session.get(WarmupEvent, task["event_id"])
         if event is None:
+            IN_MEMORY_INFLIGHT.pop(inflight_key, None)
             raise HTTPException(status_code=404, detail="Queue event not found")
 
         try:
@@ -1108,11 +1170,13 @@ def process_next(queue_name: str = "send_execution") -> dict:
             event.status = "processed"
             event.outcome = "success"
             session.commit()
+            IN_MEMORY_INFLIGHT.pop(inflight_key, None)
             METRICS["queue_processed"] += 1
             refresh_slo_metrics()
             refresh_queue_backlog_metrics()
             return {"processed": 1, "backend": "in-memory", "result": result}
         except Exception as exc:
+            IN_MEMORY_INFLIGHT.pop(inflight_key, None)
             event.retry_count += 1
             attempts = task.get("attempt", 1)
             max_attempts = int(task.get("max_attempts", 4))
@@ -1149,6 +1213,55 @@ def process_next(queue_name: str = "send_execution") -> dict:
 @app.get("/warmup/worker/dlq")
 def list_dlq() -> dict:
     return {"items": list(DEAD_LETTER_QUEUE)}
+
+
+@app.get("/warmup/worker/inflight")
+def list_inflight() -> dict:
+    items = []
+    for key, item in IN_MEMORY_INFLIGHT.items():
+        lease_until = item.get("lease_until")
+        items.append(
+            {
+                "key": key,
+                "queue_name": item.get("queue_name"),
+                "event_id": (item.get("task") or {}).get("event_id"),
+                "attempt": (item.get("task") or {}).get("attempt"),
+                "lease_until": lease_until.isoformat() if isinstance(lease_until, datetime) else None,
+            }
+        )
+    return {"items": items}
+
+
+@app.post("/warmup/worker/lease/renew")
+def renew_lease(payload: LeaseRenewRequest) -> dict:
+    key = _event_key(payload.queue_name, payload.event_id)
+    item = IN_MEMORY_INFLIGHT.get(key)
+    if not item:
+        raise HTTPException(status_code=404, detail="Inflight lease not found")
+    item["lease_until"] = utc_now() + timedelta(seconds=payload.extend_seconds)
+    METRICS["queue_leases_renewed"] += 1
+    return {"renewed": True, "event_id": payload.event_id, "queue_name": payload.queue_name}
+
+
+@app.post("/warmup/worker/sweep-stuck")
+def sweep_stuck_tasks(
+    x_admin_api_key: str | None = Header(default=None),
+    x_admin_actor: str = Header(default="system"),
+    authorization: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin")
+    actor = claims.get("sub") if claims else x_admin_actor
+    result = sweep_stuck_inflight_tasks()
+    with Session(engine) as session:
+        write_admin_audit_log(
+            session,
+            actor=actor,
+            action="sweep_stuck_tasks",
+            resource_type="warmup_queue",
+            details=result,
+        )
+        session.commit()
+    return {"swept": True, **result}
 
 
 @app.post("/warmup/worker/dlq/replay")

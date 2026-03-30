@@ -51,6 +51,7 @@ services:
       OTEL_ENABLE_CONSOLE_EXPORTER: "false"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       WARMUP_ADMIN_API_KEY: ${WARMUP_ADMIN_API_KEY:-}
+      WARMUP_QUEUE_VISIBILITY_TIMEOUT_SECONDS: ${WARMUP_QUEUE_VISIBILITY_TIMEOUT_SECONDS:-45}
     depends_on:
       - redis
     ports:
@@ -153,6 +154,13 @@ services:
       BILLING_ADMIN_API_KEY: ${BILLING_ADMIN_API_KEY:-}
       BILLING_PROVIDER_CONFIG_PATH: ${BILLING_PROVIDER_CONFIG_PATH:-/app/data/payment-providers.enc}
       BILLING_CONFIG_ENC_KEY: ${BILLING_CONFIG_ENC_KEY:-}
+      BILLING_SECRET_BACKEND: ${BILLING_SECRET_BACKEND:-file}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_PAYMENT_CONFIG_PATH: ${VAULT_PAYMENT_CONFIG_PATH:-secret/data/email-warmup/billing/providers}
+      KMS_ENCRYPT_URL: ${KMS_ENCRYPT_URL:-}
+      KMS_DECRYPT_URL: ${KMS_DECRYPT_URL:-}
+      KMS_AUTH_TOKEN: ${KMS_AUTH_TOKEN:-}
       RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
       RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
       RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
@@ -183,11 +191,23 @@ services:
   prometheus:
     image: prom/prometheus:v2.54.1
     command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    depends_on:
+      - alertmanager
     volumes:
       - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./ops/alerts:/etc/prometheus/alerts:ro
     ports:
       - "9090:9090"
+    networks:
+      - app-net
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    volumes:
+      - ./ops/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
     networks:
       - app-net
 
