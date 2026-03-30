@@ -1,13 +1,17 @@
 import importlib.util
+import sys
+import uuid
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 
 def load_app(module_path: str):
-    spec = importlib.util.spec_from_file_location("service_module", module_path)
+    module_name = f"service_module_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module.app
 
@@ -134,7 +138,7 @@ def test_warmup_schedule_generation_and_entropy():
 def test_warmup_queue_idempotency_and_dlq_flow():
     client = TestClient(warmup_app)
 
-    idem = "tenant-queue-mailbox-0001"
+    idem = f"tenant-queue-mailbox-{uuid.uuid4().hex[:16]}"
     first = client.post(
         "/warmup/worker/enqueue",
         json={

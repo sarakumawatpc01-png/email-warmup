@@ -6,6 +6,23 @@ const stripeSecret = process.env.STRIPE_SECRET_KEY || '';
 const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = stripeSecret ? new Stripe(stripeSecret) : null;
 
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!stripe || !stripeWebhookSecret) {
+    return res.status(200).json({ accepted: true, note: 'stripe not configured' });
+  }
+
+  const signature = req.headers['stripe-signature'];
+  try {
+    stripe.webhooks.constructEvent(req.body, signature, stripeWebhookSecret);
+    return res.json({ received: true });
+  } catch (error) {
+    console.error('Stripe webhook verification failed');
+    return res.status(400).json({ error: 'Invalid webhook signature' });
+  }
+});
+
+app.use(express.json());
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'billing' });
 });
@@ -23,23 +40,6 @@ app.post('/subscriptions/preview', async (req, res) => {
     stripe_enabled: Boolean(stripe),
   });
 });
-
-app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
-  if (!stripe || !stripeWebhookSecret) {
-    return res.status(200).json({ accepted: true, note: 'stripe not configured' });
-  }
-
-  const signature = req.headers['stripe-signature'];
-  try {
-    stripe.webhooks.constructEvent(req.body, signature, stripeWebhookSecret);
-    return res.json({ received: true });
-  } catch (error) {
-    console.error('Stripe webhook verification failed');
-    return res.status(400).json({ error: 'Invalid webhook signature' });
-  }
-});
-
-app.use(express.json());
 
 app.listen(3001, () => {
   console.log('billing listening on 3001');

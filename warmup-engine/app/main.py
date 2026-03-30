@@ -366,7 +366,7 @@ def pick_partners(profile: MailboxProfile, pool: list[str], requested_count: int
             seen_count = histogram.get(candidate, 0)
             weight = 1 / (1 + seen_count)
             if candidate == last_partner:
-                weight *= 0.2  # avoid repetitive pair loops
+                weight *= 0.2  # reduce immediate reselection probability for the same partner
             weighted.append((candidate, weight))
 
         total_weight = sum(weight for _, weight in weighted)
