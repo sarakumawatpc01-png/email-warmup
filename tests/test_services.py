@@ -239,3 +239,44 @@ def test_warmup_abuse_and_kill_switch():
         },
     )
     assert blocked_job.status_code == 423
+
+
+def test_warmup_prometheus_metrics_endpoint():
+    client = TestClient(warmup_app)
+    response = client.get("/metrics/prometheus")
+    assert response.status_code == 200
+    assert "warmup_http_requests_total" in response.text
+
+
+def test_warmup_provider_profile_tuning_is_deterministic():
+    client = TestClient(warmup_app)
+
+    gmail_job = client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": "tenant-provider",
+            "mailbox": "mailer@gmail.com",
+            "domain_age_days": 90,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert gmail_job.status_code == 200
+
+    tuned = client.post(
+        "/warmup/reputation/score",
+        json={
+            "tenant_id": "tenant-provider",
+            "mailbox": "mailer@gmail.com",
+            "inbox_rate": 0.9,
+            "spam_rate": 0.02,
+            "bounce_rate": 0.01,
+            "complaint_rate": 0.001,
+            "reply_rate": 0.3,
+            "blacklist_detected": False,
+        },
+    )
+    assert tuned.status_code == 200
+    body = tuned.json()
+    assert body["mode"] in {"normal", "rescue", "throttle"}
+    assert body["daily_target"] > 0
