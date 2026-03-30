@@ -1,6 +1,7 @@
 import express from 'express';
 import Stripe from 'stripe';
 import crypto from 'crypto';
+import rateLimit from 'express-rate-limit';
 import { context, propagation, trace } from '@opentelemetry/api';
 import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
@@ -63,6 +64,25 @@ function auditLog(event, details = {}) {
   console.log(JSON.stringify({ event, ...details, at: new Date().toISOString() }));
 }
 
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const adminReadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const adminWriteLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 function verifyHmac(bodyBuffer, signature, secret) {
   if (!secret || !signature) {
     return false;
@@ -76,7 +96,7 @@ function verifyHmac(bodyBuffer, signature, secret) {
   return crypto.timingSafeEqual(left, right);
 }
 
-app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/webhooks/stripe', webhookLimiter, express.raw({ type: 'application/json' }), (req, res) => {
   if (!stripe || !stripeWebhookSecret) {
     return res.status(200).json({ accepted: true, note: 'stripe not configured' });
   }
@@ -91,7 +111,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), (req, re
   }
 });
 
-app.post('/webhooks/razorpay', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/webhooks/razorpay', webhookLimiter, express.raw({ type: 'application/json' }), (req, res) => {
   const secret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
   if (!secret) {
     return res.status(200).json({ accepted: true, note: 'razorpay not configured' });
@@ -103,7 +123,7 @@ app.post('/webhooks/razorpay', express.raw({ type: 'application/json' }), (req, 
   return res.json({ received: true });
 });
 
-app.post('/webhooks/phonepe', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/webhooks/phonepe', webhookLimiter, express.raw({ type: 'application/json' }), (req, res) => {
   const secret = process.env.PHONEPE_WEBHOOK_SECRET || '';
   if (!secret) {
     return res.status(200).json({ accepted: true, note: 'phonepe not configured' });
@@ -115,7 +135,7 @@ app.post('/webhooks/phonepe', express.raw({ type: 'application/json' }), (req, r
   return res.json({ received: true });
 });
 
-app.post('/webhooks/paytm', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/webhooks/paytm', webhookLimiter, express.raw({ type: 'application/json' }), (req, res) => {
   const secret = process.env.PAYTM_WEBHOOK_SECRET || '';
   if (!secret) {
     return res.status(200).json({ accepted: true, note: 'paytm not configured' });
@@ -173,14 +193,14 @@ app.post('/subscriptions/preview', async (req, res) => {
   });
 });
 
-app.get('/admin/payments/providers', (req, res) => {
+app.get('/admin/payments/providers', adminReadLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Admin API key required' });
   }
   return res.json({ providers: paymentProviders });
 });
 
-app.post('/admin/payments/providers/:provider/setup', (req, res) => {
+app.post('/admin/payments/providers/:provider/setup', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Admin API key required' });
   }
