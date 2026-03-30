@@ -3,7 +3,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 from fastapi.testclient import TestClient
 
@@ -284,10 +284,22 @@ def test_warmup_provider_profile_tuning_is_deterministic():
     assert body["daily_target"] > 0
 
 
+_MAILBOX_STRATEGY = st.builds(
+    lambda local, domain: f"{local}@{domain}",
+    local=st.text(
+        alphabet=st.characters(min_codepoint=97, max_codepoint=122),
+        min_size=3,
+        max_size=10,
+    ),
+    domain=st.sampled_from(["partners.test", "warmup.local", "network.local", "example.net"]),
+).map(str.lower)
+
+
+@settings(max_examples=30)
 @given(
     requested_count=st.integers(min_value=1, max_value=80),
     partner_pool=st.lists(
-        st.emails().map(str.lower),
+        _MAILBOX_STRATEGY,
         min_size=0,
         max_size=15,
         unique=True,
