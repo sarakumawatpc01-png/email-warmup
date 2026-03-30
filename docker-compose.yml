@@ -20,7 +20,7 @@ services:
       - app-net
 
   auth:
-    build: ./services/auth
+    build: ./backend/services/auth
     environment:
       JWT_SECRET: ${JWT_SECRET:-dev-secret}
       JWT_ALGORITHM: HS256
@@ -30,8 +30,8 @@ services:
     networks:
       - app-net
 
-  lead-service:
-    build: ./services/lead-service
+  lead_service:
+    build: ./backend/services/lead-service
     environment:
       DATABASE_URL: postgresql+psycopg://email_saas:email_saas@postgres:5432/email_saas
       JWT_SECRET: ${JWT_SECRET:-dev-secret}
@@ -42,51 +42,51 @@ services:
     networks:
       - app-net
 
-  warmup-engine:
-    build: ./services/warmup-engine
+  warmup_engine:
+    build: ./warmup-engine
     ports:
       - "8003:8003"
     networks:
       - app-net
 
-  verification-engine:
-    build: ./services/verification-engine
+  verification_engine:
+    build: ./verification-engine
     ports:
       - "8004:8004"
     networks:
       - app-net
 
-  ai-agent:
-    build: ./services/ai-agent
+  ai_agent:
+    build: ./ai-agent
     ports:
       - "8005:8005"
     networks:
       - app-net
 
-  gateway:
-    build: ./services/gateway
+  backend:
+    build: ./backend
     environment:
       AUTH_SERVICE_URL: http://auth:8001
-      LEAD_SERVICE_URL: http://lead-service:8002
-      WARMUP_SERVICE_URL: http://warmup-engine:8003
-      VERIFICATION_SERVICE_URL: http://verification-engine:8004
-      AI_AGENT_SERVICE_URL: http://ai-agent:8005
+      LEAD_SERVICE_URL: http://lead_service:8002
+      WARMUP_SERVICE_URL: http://warmup_engine:8003
+      VERIFICATION_SERVICE_URL: http://verification_engine:8004
+      AI_AGENT_SERVICE_URL: http://ai_agent:8005
       CRM_SERVICE_URL: http://crm:8070
-      BILLING_SERVICE_URL: http://billing:3001
-      WHATSAPP_SERVICE_URL: http://whatsapp-service:3002
+      BILLING_SERVICE_URL: http://billing_service:3001
+      WHATSAPP_SERVICE_URL: http://whatsapp_service:3002
     depends_on:
       - auth
-      - lead-service
-      - warmup-engine
-      - verification-engine
-      - ai-agent
+      - lead_service
+      - warmup_engine
+      - verification_engine
+      - ai_agent
     ports:
       - "8000:8000"
     networks:
       - app-net
 
-  billing:
-    build: ./services/billing
+  billing_service:
+    build: ./billing-service
     environment:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
@@ -95,8 +95,8 @@ services:
     networks:
       - app-net
 
-  whatsapp-service:
-    build: ./services/whatsapp-service
+  whatsapp_service:
+    build: ./backend/services/whatsapp-service
     ports:
       - "3002:3002"
     networks:
@@ -119,23 +119,23 @@ services:
       - app-net
 
   frontend-client:
-    build: ./frontend/frontend-client
+    build: ./frontend/client
     ports:
       - "5173:80"
     networks:
       - app-net
 
   frontend-admin:
-    build: ./frontend/frontend-admin
+    build: ./frontend/superadmin
     ports:
       - "5174:80"
     networks:
       - app-net
 
   nginx:
-    build: ./infra/nginx
+    build: ./nginx
     depends_on:
-      - gateway
+      - backend
       - frontend-client
       - frontend-admin
     ports:

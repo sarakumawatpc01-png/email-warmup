@@ -21,12 +21,12 @@ app.add_middleware(
 
 TARGETS = {
     "auth": os.getenv("AUTH_SERVICE_URL", "http://auth:8001"),
-    "leads": os.getenv("LEAD_SERVICE_URL", "http://lead-service:8002"),
-    "warmup": os.getenv("WARMUP_SERVICE_URL", "http://warmup-engine:8003"),
-    "verification": os.getenv("VERIFICATION_SERVICE_URL", "http://verification-engine:8004"),
-    "ai": os.getenv("AI_AGENT_SERVICE_URL", "http://ai-agent:8005"),
-    "billing": os.getenv("BILLING_SERVICE_URL", "http://billing:3001"),
-    "whatsapp": os.getenv("WHATSAPP_SERVICE_URL", "http://whatsapp-service:3002"),
+    "leads": os.getenv("LEAD_SERVICE_URL", "http://lead_service:8002"),
+    "warmup": os.getenv("WARMUP_SERVICE_URL", "http://warmup_engine:8003"),
+    "verification": os.getenv("VERIFICATION_SERVICE_URL", "http://verification_engine:8004"),
+    "ai": os.getenv("AI_AGENT_SERVICE_URL", "http://ai_agent:8005"),
+    "billing": os.getenv("BILLING_SERVICE_URL", "http://billing_service:3001"),
+    "whatsapp": os.getenv("WHATSAPP_SERVICE_URL", "http://whatsapp_service:3002"),
     "crm": os.getenv("CRM_SERVICE_URL", "http://crm:8070"),
 }
 

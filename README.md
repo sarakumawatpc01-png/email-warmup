@@ -1,23 +1,25 @@
 # email-warmup
 
-This repository now follows the uploaded build docs (`MasterBuildPlan_v2_Complete.docx` and `EmailSaaS_Supplement_v1.docx`) with a production-style microservices baseline for an Email Marketing SaaS platform.
+This repository now uses the supplement-style monorepo naming from the uploaded docs (`MasterBuildPlan_v2_Complete.docx` and `EmailSaaS_Supplement_v1.docx`) while preserving current functionality.
 
-## Structure
+## Structure (aligned)
 
-- `services/` → backend services
-  - `gateway` (FastAPI API gateway)
+- `backend/` → FastAPI API gateway (`backend/app/main.py`)
+- `backend/services/`
   - `auth` (JWT auth)
   - `lead-service` (tenant-scoped lead API + PostgreSQL)
-  - `warmup-engine` (warm-up scheduling simulation)
-  - `verification-engine` (syntax/domain/MX/SMTP verification pipeline)
-  - `ai-agent` (action orchestration)
-  - `billing` (Node.js + Stripe webhook endpoints)
   - `whatsapp-service` (Node.js WhatsApp campaign endpoints)
+- `warmup-engine/` (warm-up scheduling simulation)
+- `verification-engine/` (syntax/domain/MX/SMTP verification pipeline)
+- `ai-agent/` (action orchestration)
+- `billing-service/` (Node.js + Stripe webhook endpoints)
 - `frontend/`
-  - `frontend-client`
-  - `frontend-admin`
-- `infra/nginx` → reverse proxy and secure headers
-- `scripts/provision_mautic_client.sh` → client Mautic provisioning stub
+  - `client`
+  - `superadmin`
+- `nginx/` → reverse proxy and secure headers
+- `onboarding-scripts/`
+  - `provision_client.sh`
+  - `deprovision_client.sh`
 - `tests/` → backend smoke tests
 
 ## Environment
@@ -30,7 +32,7 @@ Copy `.env.example` to `.env` and update values.
 docker compose up --build
 ```
 
-## Core Endpoints (via gateway)
+## Core Endpoints (via backend gateway)
 
 - `POST /auth/signup`
 - `POST /auth/login`

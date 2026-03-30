@@ -13,9 +13,9 @@ def load_app(module_path: str):
 
 
 ROOT = Path(__file__).resolve().parents[1]
-auth_app = load_app(str(ROOT / "services/auth/app/main.py"))
-warmup_app = load_app(str(ROOT / "services/warmup-engine/app/main.py"))
-verification_app = load_app(str(ROOT / "services/verification-engine/app/main.py"))
+auth_app = load_app(str(ROOT / "backend/services/auth/app/main.py"))
+warmup_app = load_app(str(ROOT / "warmup-engine/app/main.py"))
+verification_app = load_app(str(ROOT / "verification-engine/app/main.py"))
 
 
 def test_auth_signup_login_and_verify():
