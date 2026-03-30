@@ -14,6 +14,8 @@ app = FastAPI(title="Auth Service", version="1.0.0")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+RETURN_RESET_OTP = os.getenv("RETURN_RESET_OTP", "false").lower() == "true"
+OTP_LENGTH = int(os.getenv("OTP_LENGTH", "8"))
 
 users: Dict[str, dict] = {}
 reset_otps: Dict[str, dict] = {}
@@ -37,7 +39,7 @@ class ResetRequest(BaseModel):
 
 class ResetConfirmRequest(BaseModel):
     email: EmailStr
-    otp: str = Field(min_length=6, max_length=6)
+    otp: str = Field(min_length=6, max_length=12)
     new_password: str = Field(min_length=8)
 
 
@@ -105,12 +107,14 @@ def password_reset_request(payload: ResetRequest) -> dict:
     if key not in users:
         return {"status": "accepted"}
 
-    otp = f"{secrets.randbelow(1000000):06d}"
+    otp = "".join(secrets.choice("0123456789") for _ in range(OTP_LENGTH))
     reset_otps[key] = {
         "otp": otp,
         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
     }
-    return {"status": "accepted", "otp": otp}
+    if RETURN_RESET_OTP:
+        return {"status": "accepted", "otp": otp}
+    return {"status": "accepted"}
 
 
 @app.post("/password-reset/confirm")

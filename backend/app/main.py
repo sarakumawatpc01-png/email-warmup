@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="API Gateway", version="1.0.0")
+# localhost defaults: 80=nginx entrypoint, 5173=client app, 5174=superadmin app
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:80,http://localhost:5173,http://localhost:5174").split(",")

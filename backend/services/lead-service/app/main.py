@@ -4,7 +4,7 @@ from typing import Optional
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import Index, String, create_engine, func, select
+from sqlalchemy import Index, String, create_engine, func, or_, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///./lead.db")
@@ -121,7 +121,11 @@ def list_leads(
         if q:
             pattern = f"{q}%"
             stmt = stmt.where(
-                Lead.email.ilike(pattern) | Lead.company.ilike(pattern) | Lead.job_title.ilike(pattern)
+                or_(
+                    Lead.email.ilike(pattern),
+                    func.coalesce(Lead.company, "").ilike(pattern),
+                    func.coalesce(Lead.job_title, "").ilike(pattern),
+                )
             )
 
         total_stmt = select(func.count()).select_from(stmt.subquery())

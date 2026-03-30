@@ -1,4 +1,5 @@
 import random
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
@@ -33,7 +34,7 @@ def create_job(payload: WarmupJobRequest) -> dict:
     reply_simulation_rate = round(random.uniform(0.18, 0.42), 2)
     spam_rescue_rate = round(random.uniform(0.03, 0.11), 2)
 
-    job_id = f"warmup-{len(jobs)+1}"
+    job_id = f"warmup-{uuid.uuid4().hex[:12]}"
     next_run = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
     jobs[job_id] = {
         "job_id": job_id,

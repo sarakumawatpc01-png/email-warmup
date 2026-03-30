@@ -14,7 +14,7 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${name}$"; then
   exit 0
 fi
 
-docker run -d --name "${name}" --network email-warmup_app-net -p 0:80 php:8.2-apache \
+docker run -d --name "${name}" --network app-net -p 0:80 php:8.2-apache \
   sh -c "echo '<?php echo \"Mautic instance for ${tenant}\"; ?>' > /var/www/html/index.php && apache2-foreground"
 
 echo "Provisioned ${name}"
