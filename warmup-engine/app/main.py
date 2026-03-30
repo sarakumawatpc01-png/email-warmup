@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
-from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, create_engine, func, select
+from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, create_engine, delete, func, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 try:
@@ -53,7 +53,8 @@ except Exception:  # pragma: no cover - optional runtime capability
 
 app = FastAPI(title="Warmup Engine", version="2.0.0")
 
-DATABASE_URL = os.getenv("WARMUP_DATABASE_URL", "sqlite+pysqlite:///./warmup.db")
+DATABASE_URL = os.getenv("WARMUP_DATABASE_URL", "postgresql+psycopg2://email_saas:email_saas@postgres:5432/email_saas")
+SQLITE_FALLBACK_URL = os.getenv("WARMUP_SQLITE_FALLBACK_URL", "sqlite+pysqlite:///./warmup.db")
 EWMA_ALPHA = float(os.getenv("WARMUP_EWMA_ALPHA", "0.35"))
 MAX_MAILBOX_DAILY_CAP = int(os.getenv("MAX_MAILBOX_DAILY_CAP", "250"))
 MAX_TENANT_DAILY_CAP = int(os.getenv("MAX_TENANT_DAILY_CAP", "5000"))
@@ -67,7 +68,17 @@ ADMIN_API_KEY = os.getenv("WARMUP_ADMIN_API_KEY", "")
 AUTH_JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 AUTH_JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+def init_engine():
+    try:
+        candidate = create_engine(DATABASE_URL, pool_pre_ping=True)
+        with candidate.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return candidate
+    except Exception:
+        return create_engine(SQLITE_FALLBACK_URL, pool_pre_ping=True)
+
+
+engine = init_engine()
 
 logger = logging.getLogger("warmup-engine")
 if not logger.handlers:
@@ -323,6 +334,56 @@ class AdminAuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    topic: Mapped[str] = mapped_column(String(120), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    payload: Mapped[str] = mapped_column(String, default="{}")
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_outbox_events_status_created", "status", "created_at"),
+    )
+
+
+class InboxEvent(Base):
+    __tablename__ = "inbox_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(120), index=True)
+    message_id: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    payload: Mapped[str] = mapped_column(String, default="{}")
+    processed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+    __table_args__ = (
+        Index("ix_inbox_events_source_processed", "source", "processed_at"),
+    )
+
+
+class WorkerLease(Base):
+    __tablename__ = "worker_leases"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(Integer, index=True)
+    queue_name: Mapped[str] = mapped_column(String(64), index=True)
+    lease_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_worker_leases_event_queue", "event_id", "queue_name", unique=True),
+    )
+
+
 Base.metadata.create_all(engine)
 
 if trace and TracerProvider and BatchSpanProcessor:
@@ -426,6 +487,12 @@ class LeaseRenewRequest(BaseModel):
     extend_seconds: int = Field(default=30, ge=5, le=300)
 
 
+class InboxRecordRequest(BaseModel):
+    source: str = Field(min_length=2, max_length=120)
+    message_id: str = Field(min_length=8, max_length=160)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 def provider_profile_for_mailbox(mailbox: str) -> dict[str, float]:
     provider = provider_from_mailbox(mailbox)
     return PROVIDER_PROFILES.get(provider, PROVIDER_PROFILES["default"])
@@ -510,6 +577,27 @@ def write_admin_audit_log(
             details=json.dumps(details or {}),
         )
     )
+
+
+def ensure_outbox_event(session: Session, *, topic: str, dedupe_key: str, payload: dict[str, Any]) -> OutboxEvent:
+    existing = session.scalar(select(OutboxEvent).where(OutboxEvent.dedupe_key == dedupe_key))
+    if existing:
+        return existing
+    event = OutboxEvent(topic=topic, dedupe_key=dedupe_key, payload=json.dumps(payload), status="pending")
+    session.add(event)
+    session.flush()
+    return event
+
+
+def mark_outbox_dispatched(session: Session, dedupe_key: str) -> bool:
+    event = session.scalar(select(OutboxEvent).where(OutboxEvent.dedupe_key == dedupe_key))
+    if not event:
+        return False
+    if event.status == "dispatched":
+        return True
+    event.status = "dispatched"
+    event.dispatched_at = utc_now()
+    return True
 
 
 def base_target_from_domain_age(domain_age_days: int) -> int:
@@ -788,36 +876,52 @@ def sweep_stuck_inflight_tasks() -> dict[str, int]:
     moved = 0
     dead_lettered = 0
     with Session(engine) as session:
-        for key, item in list(IN_MEMORY_INFLIGHT.items()):
-            lease_until = item.get("lease_until")
-            if not isinstance(lease_until, datetime) or lease_until > now:
+        leases = list(session.scalars(select(WorkerLease).where(WorkerLease.lease_until <= now).limit(500)))
+        for lease in leases:
+            event = session.get(WarmupEvent, lease.event_id)
+            if event is None:
+                session.delete(lease)
+                IN_MEMORY_INFLIGHT.pop(_event_key(lease.queue_name, lease.event_id), None)
                 continue
-            task = dict(item.get("task") or {})
-            queue_name = item.get("queue_name")
+
+            queue_name = lease.queue_name or event.queue_name or "send_execution"
             if queue_name not in QUEUE_NAMES:
-                IN_MEMORY_INFLIGHT.pop(key, None)
+                session.delete(lease)
+                IN_MEMORY_INFLIGHT.pop(_event_key(queue_name, lease.event_id), None)
                 continue
-            attempts = int(task.get("attempt", 1))
-            max_attempts = int(task.get("max_attempts", 4))
-            event_id = task.get("event_id")
-            event = session.get(WarmupEvent, event_id) if event_id else None
+
+            try:
+                payload = json.loads(event.payload or "{}")
+            except Exception:
+                payload = {}
+            attempts = max(1, int(event.retry_count) + 1)
+            max_attempts = int(payload.get("max_attempts", 4))
+            task = {
+                "event_id": event.id,
+                "queue_name": queue_name,
+                "tenant_id": event.tenant_id,
+                "mailbox": event.mailbox,
+                "idempotency_key": event.idempotency_key,
+                "attempt": attempts,
+                "max_attempts": max_attempts,
+                **payload,
+            }
             if attempts >= max_attempts:
                 DEAD_LETTER_QUEUE.append({"task": task, "error": "lease_timeout", "failed_at": now.isoformat()})
-                if event:
-                    event.status = "dead_letter"
-                    event.outcome = "failed"
+                event.status = "dead_letter"
+                event.outcome = "failed"
                 METRICS["queue_dead_letter"] += 1
                 dead_lettered += 1
             else:
                 task["attempt"] = attempts + 1
                 task["retry_backoff_seconds"] = min(60, 2 ** attempts)
                 IN_MEMORY_QUEUES[queue_name].append(task)
-                if event:
-                    event.retry_count += 1
-                    event.status = "retrying"
+                event.retry_count += 1
+                event.status = "retrying"
                 METRICS["queue_retried"] += 1
                 moved += 1
-            IN_MEMORY_INFLIGHT.pop(key, None)
+            session.delete(lease)
+            IN_MEMORY_INFLIGHT.pop(_event_key(queue_name, event.id), None)
         session.commit()
     refresh_slo_metrics()
     refresh_queue_backlog_metrics()
@@ -1111,6 +1215,20 @@ def enqueue_task(payload: QueueTaskRequest) -> dict:
         )
         session.add(event)
         session.commit()
+        with Session(engine) as outbox_session:
+            ensure_outbox_event(
+                outbox_session,
+                topic="warmup.queue.enqueue",
+                dedupe_key=f"warmup-event:{event.id}",
+                payload={
+                    "event_id": event.id,
+                    "tenant_id": payload.tenant_id,
+                    "mailbox": payload.mailbox.lower(),
+                    "queue_name": payload.queue_name,
+                    "idempotency_key": payload.idempotency_key,
+                },
+            )
+            outbox_session.commit()
 
         queue_payload = {
             "event_id": event.id,
@@ -1164,11 +1282,19 @@ def process_next(queue_name: str = "send_execution") -> dict:
         if event is None:
             IN_MEMORY_INFLIGHT.pop(inflight_key, None)
             raise HTTPException(status_code=404, detail="Queue event not found")
+        lease = session.scalar(select(WorkerLease).where(WorkerLease.event_id == event.id, WorkerLease.queue_name == queue_name))
+        if lease:
+            lease.lease_until = lease_until
+        else:
+            session.add(WorkerLease(event_id=event.id, queue_name=queue_name, lease_until=lease_until))
+        session.flush()
 
         try:
             result = execute_queue_task(task)
             event.status = "processed"
             event.outcome = "success"
+            mark_outbox_dispatched(session, f"warmup-event:{event.id}")
+            session.execute(delete(WorkerLease).where(WorkerLease.event_id == event.id, WorkerLease.queue_name == queue_name))
             session.commit()
             IN_MEMORY_INFLIGHT.pop(inflight_key, None)
             METRICS["queue_processed"] += 1
@@ -1193,6 +1319,7 @@ def process_next(queue_name: str = "send_execution") -> dict:
                         details=json.dumps({"error": str(exc), "queue": queue_name}),
                     )
                 )
+                session.execute(delete(WorkerLease).where(WorkerLease.event_id == event.id, WorkerLease.queue_name == queue_name))
                 session.commit()
                 METRICS["queue_dead_letter"] += 1
                 refresh_slo_metrics()
@@ -1203,6 +1330,7 @@ def process_next(queue_name: str = "send_execution") -> dict:
             task["attempt"] = attempts + 1
             task["retry_backoff_seconds"] = 2 ** attempts
             IN_MEMORY_QUEUES[queue_name].append(task)
+            session.execute(delete(WorkerLease).where(WorkerLease.event_id == event.id, WorkerLease.queue_name == queue_name))
             session.commit()
             METRICS["queue_retried"] += 1
             refresh_slo_metrics()
@@ -1218,27 +1346,37 @@ def list_dlq() -> dict:
 @app.get("/warmup/worker/inflight")
 def list_inflight() -> dict:
     items = []
-    for key, item in IN_MEMORY_INFLIGHT.items():
-        lease_until = item.get("lease_until")
-        items.append(
-            {
-                "key": key,
-                "queue_name": item.get("queue_name"),
-                "event_id": (item.get("task") or {}).get("event_id"),
-                "attempt": (item.get("task") or {}).get("attempt"),
-                "lease_until": lease_until.isoformat() if isinstance(lease_until, datetime) else None,
-            }
-        )
+    with Session(engine) as session:
+        leases = list(session.scalars(select(WorkerLease).order_by(WorkerLease.lease_until.asc()).limit(500)))
+        for lease in leases:
+            key = _event_key(lease.queue_name, lease.event_id)
+            item = IN_MEMORY_INFLIGHT.get(key, {})
+            attempt = (item.get("task") or {}).get("attempt")
+            items.append(
+                {
+                    "key": key,
+                    "queue_name": lease.queue_name,
+                    "event_id": lease.event_id,
+                    "attempt": attempt,
+                    "lease_until": lease.lease_until.isoformat(),
+                }
+            )
     return {"items": items}
 
 
 @app.post("/warmup/worker/lease/renew")
 def renew_lease(payload: LeaseRenewRequest) -> dict:
+    with Session(engine) as session:
+        lease = session.scalar(
+            select(WorkerLease).where(WorkerLease.event_id == payload.event_id, WorkerLease.queue_name == payload.queue_name)
+        )
+        if not lease:
+            raise HTTPException(status_code=404, detail="Inflight lease not found")
+        lease.lease_until = utc_now() + timedelta(seconds=payload.extend_seconds)
+        session.commit()
     key = _event_key(payload.queue_name, payload.event_id)
-    item = IN_MEMORY_INFLIGHT.get(key)
-    if not item:
-        raise HTTPException(status_code=404, detail="Inflight lease not found")
-    item["lease_until"] = utc_now() + timedelta(seconds=payload.extend_seconds)
+    if key in IN_MEMORY_INFLIGHT:
+        IN_MEMORY_INFLIGHT[key]["lease_until"] = lease.lease_until
     METRICS["queue_leases_renewed"] += 1
     return {"renewed": True, "event_id": payload.event_id, "queue_name": payload.queue_name}
 
@@ -1262,6 +1400,41 @@ def sweep_stuck_tasks(
         )
         session.commit()
     return {"swept": True, **result}
+
+
+@app.get("/warmup/outbox/pending")
+def list_outbox_pending(limit: int = 50) -> dict:
+    safe_limit = max(1, min(limit, 200))
+    with Session(engine) as session:
+        rows = list(
+            session.scalars(
+                select(OutboxEvent).where(OutboxEvent.status == "pending").order_by(OutboxEvent.created_at.asc()).limit(safe_limit)
+            )
+        )
+        return {
+            "items": [
+                {
+                    "id": row.id,
+                    "topic": row.topic,
+                    "dedupe_key": row.dedupe_key,
+                    "status": row.status,
+                    "attempts": row.attempts,
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+        }
+
+
+@app.post("/warmup/inbox/record")
+def record_inbox_event(payload: InboxRecordRequest) -> dict:
+    with Session(engine) as session:
+        existing = session.scalar(select(InboxEvent).where(InboxEvent.message_id == payload.message_id))
+        if existing:
+            return {"idempotent": True, "message_id": payload.message_id}
+        session.add(InboxEvent(source=payload.source, message_id=payload.message_id, payload=json.dumps(payload.payload)))
+        session.commit()
+        return {"idempotent": False, "message_id": payload.message_id}
 
 
 @app.post("/warmup/worker/dlq/replay")

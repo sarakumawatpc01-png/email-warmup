@@ -435,6 +435,41 @@ def test_warmup_admin_tenant_scope_denied_for_tenant_admin():
     assert denied.status_code == 403
 
 
+def test_warmup_outbox_and_inbox_idempotency():
+    client = TestClient(warmup_app)
+    idem = f"outbox-{uuid.uuid4().hex[:16]}"
+    enqueue = client.post(
+        "/warmup/worker/enqueue",
+        json={
+            "tenant_id": "tenant-outbox",
+            "mailbox": "outbox@example.com",
+            "queue_name": "send_execution",
+            "idempotency_key": idem,
+            "payload": {"force_fail": False},
+            "max_attempts": 2,
+        },
+    )
+    assert enqueue.status_code == 200
+
+    outbox = client.get("/warmup/outbox/pending")
+    assert outbox.status_code == 200
+    assert any(item["dedupe_key"] == f"warmup-event:{enqueue.json()['event_id']}" for item in outbox.json()["items"])
+
+    first_inbox = client.post(
+        "/warmup/inbox/record",
+        json={"source": "billing-webhook", "message_id": f"msg-{uuid.uuid4().hex[:12]}", "payload": {"type": "charge.succeeded"}},
+    )
+    assert first_inbox.status_code == 200
+    assert first_inbox.json()["idempotent"] is False
+
+    second_inbox = client.post(
+        "/warmup/inbox/record",
+        json={"source": "billing-webhook", "message_id": first_inbox.json()["message_id"], "payload": {"type": "charge.succeeded"}},
+    )
+    assert second_inbox.status_code == 200
+    assert second_inbox.json()["idempotent"] is True
+
+
 def test_warmup_prometheus_metrics_endpoint():
     client = TestClient(warmup_app)
     response = client.get("/metrics/prometheus")

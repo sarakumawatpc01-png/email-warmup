@@ -46,13 +46,15 @@ services:
     build: ./warmup-engine
     environment:
       REDIS_URL: redis://redis:6379/0
-      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+      WARMUP_DATABASE_URL: ${WARMUP_DATABASE_URL:-postgresql+psycopg2://email_saas:email_saas@postgres:5432/email_saas}
+      WARMUP_SQLITE_FALLBACK_URL: ${WARMUP_SQLITE_FALLBACK_URL:-sqlite+pysqlite:///./warmup.db}
       PROMETHEUS_ENABLED: "true"
       OTEL_ENABLE_CONSOLE_EXPORTER: "false"
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
       WARMUP_ADMIN_API_KEY: ${WARMUP_ADMIN_API_KEY:-}
       WARMUP_QUEUE_VISIBILITY_TIMEOUT_SECONDS: ${WARMUP_QUEUE_VISIBILITY_TIMEOUT_SECONDS:-45}
     depends_on:
+      - postgres
       - redis
     ports:
       - "8003:8003"
@@ -64,8 +66,10 @@ services:
     command: ["rq", "worker", "schedule_generation", "--url", "redis://redis:6379/0"]
     environment:
       REDIS_URL: redis://redis:6379/0
-      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+      WARMUP_DATABASE_URL: ${WARMUP_DATABASE_URL:-postgresql+psycopg2://email_saas:email_saas@postgres:5432/email_saas}
+      WARMUP_SQLITE_FALLBACK_URL: ${WARMUP_SQLITE_FALLBACK_URL:-sqlite+pysqlite:///./warmup.db}
     depends_on:
+      - postgres
       - redis
       - warmup_engine
     networks:
@@ -76,8 +80,10 @@ services:
     command: ["rq", "worker", "send_execution", "--url", "redis://redis:6379/0"]
     environment:
       REDIS_URL: redis://redis:6379/0
-      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+      WARMUP_DATABASE_URL: ${WARMUP_DATABASE_URL:-postgresql+psycopg2://email_saas:email_saas@postgres:5432/email_saas}
+      WARMUP_SQLITE_FALLBACK_URL: ${WARMUP_SQLITE_FALLBACK_URL:-sqlite+pysqlite:///./warmup.db}
     depends_on:
+      - postgres
       - redis
       - warmup_engine
     networks:
@@ -88,8 +94,10 @@ services:
     command: ["rq", "worker", "reply_simulation", "--url", "redis://redis:6379/0"]
     environment:
       REDIS_URL: redis://redis:6379/0
-      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+      WARMUP_DATABASE_URL: ${WARMUP_DATABASE_URL:-postgresql+psycopg2://email_saas:email_saas@postgres:5432/email_saas}
+      WARMUP_SQLITE_FALLBACK_URL: ${WARMUP_SQLITE_FALLBACK_URL:-sqlite+pysqlite:///./warmup.db}
     depends_on:
+      - postgres
       - redis
       - warmup_engine
     networks:
@@ -100,8 +108,10 @@ services:
     command: ["rq", "worker", "reputation_scoring", "--url", "redis://redis:6379/0"]
     environment:
       REDIS_URL: redis://redis:6379/0
-      WARMUP_DATABASE_URL: sqlite+pysqlite:///./warmup.db
+      WARMUP_DATABASE_URL: ${WARMUP_DATABASE_URL:-postgresql+psycopg2://email_saas:email_saas@postgres:5432/email_saas}
+      WARMUP_SQLITE_FALLBACK_URL: ${WARMUP_SQLITE_FALLBACK_URL:-sqlite+pysqlite:///./warmup.db}
     depends_on:
+      - postgres
       - redis
       - warmup_engine
     networks:
@@ -161,6 +171,9 @@ services:
       KMS_ENCRYPT_URL: ${KMS_ENCRYPT_URL:-}
       KMS_DECRYPT_URL: ${KMS_DECRYPT_URL:-}
       KMS_AUTH_TOKEN: ${KMS_AUTH_TOKEN:-}
+      BILLING_WEBHOOK_LEDGER_PATH: ${BILLING_WEBHOOK_LEDGER_PATH:-/app/data/webhook-ledger.log}
+      BILLING_WEBHOOK_INDEX_PATH: ${BILLING_WEBHOOK_INDEX_PATH:-/app/data/webhook-index.json}
+      BILLING_RECONCILIATION_RUNS_PATH: ${BILLING_RECONCILIATION_RUNS_PATH:-/app/data/reconciliation-runs.json}
       RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
       RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
       RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}

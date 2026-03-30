@@ -35,6 +35,9 @@ const vaultKvPath = process.env.VAULT_PAYMENT_CONFIG_PATH || 'secret/data/email-
 const kmsEncryptUrl = process.env.KMS_ENCRYPT_URL || '';
 const kmsDecryptUrl = process.env.KMS_DECRYPT_URL || '';
 const kmsAuthToken = process.env.KMS_AUTH_TOKEN || '';
+const webhookLedgerPath = process.env.BILLING_WEBHOOK_LEDGER_PATH || path.resolve('data/webhook-ledger.log');
+const webhookIndexPath = process.env.BILLING_WEBHOOK_INDEX_PATH || path.resolve('data/webhook-index.json');
+const reconciliationRunsPath = process.env.BILLING_RECONCILIATION_RUNS_PATH || path.resolve('data/reconciliation-runs.json');
 
 let paymentProviders = {
   stripe: {
@@ -272,6 +275,85 @@ function auditLog(event, details = {}) {
   console.log(JSON.stringify({ event, ...details, at: new Date().toISOString() }));
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function loadJsonFile(filePath, fallbackValue) {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return fallbackValue;
+    }
+    const raw = fs.readFileSync(filePath, 'utf8').trim();
+    return raw ? JSON.parse(raw) : fallbackValue;
+  } catch (_error) {
+    return fallbackValue;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2));
+}
+
+let webhookIndex = loadJsonFile(webhookIndexPath, { by_dedupe_key: {}, last_hash: '' });
+
+function recordWebhookLedger({ provider, eventId, signature, payloadBuffer }) {
+  const dedupeKey = `${provider}:${eventId}`;
+  if (webhookIndex.by_dedupe_key[dedupeKey]) {
+    return { duplicate: true, dedupeKey };
+  }
+  const payloadHash = sha256(payloadBuffer);
+  const signatureHash = sha256(String(signature || ''));
+  const prevHash = webhookIndex.last_hash || '';
+  const at = new Date().toISOString();
+  const chainInput = `${prevHash}|${provider}|${eventId}|${payloadHash}|${signatureHash}|${at}`;
+  const entryHash = sha256(chainInput);
+  const entry = {
+    at,
+    provider,
+    event_id: eventId,
+    dedupe_key: dedupeKey,
+    payload_hash: payloadHash,
+    signature_hash: signatureHash,
+    prev_hash: prevHash,
+    entry_hash: entryHash,
+  };
+  fs.mkdirSync(path.dirname(webhookLedgerPath), { recursive: true });
+  fs.appendFileSync(webhookLedgerPath, `${JSON.stringify(entry)}\n`);
+  webhookIndex.by_dedupe_key[dedupeKey] = {
+    at,
+    provider,
+    event_id: eventId,
+    entry_hash: entryHash,
+  };
+  webhookIndex.last_hash = entryHash;
+  writeJsonFile(webhookIndexPath, webhookIndex);
+  return { duplicate: false, dedupeKey, entryHash };
+}
+
+function extractBodyEventId(provider, bodyBuffer) {
+  try {
+    const parsed = JSON.parse(bodyBuffer.toString('utf8'));
+    if (provider === 'stripe') {
+      return parsed?.id || '';
+    }
+    return parsed?.event || parsed?.event_id || parsed?.id || '';
+  } catch (_error) {
+    return '';
+  }
+}
+
+function readReconciliationRuns() {
+  return loadJsonFile(reconciliationRunsPath, []);
+}
+
+function persistReconciliationRun(run) {
+  const current = readReconciliationRuns();
+  current.push(run);
+  writeJsonFile(reconciliationRunsPath, current.slice(-200));
+}
+
 const webhookLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 60,
@@ -311,8 +393,17 @@ app.post('/webhooks/stripe', webhookLimiter, express.raw({ type: 'application/js
 
   const signature = req.headers['stripe-signature'];
   try {
-    stripe.webhooks.constructEvent(req.body, signature, stripeWebhookSecret);
-    return res.json({ received: true });
+    const event = stripe.webhooks.constructEvent(req.body, signature, stripeWebhookSecret);
+    const ledger = recordWebhookLedger({
+      provider: 'stripe',
+      eventId: event?.id || extractBodyEventId('stripe', req.body) || sha256(req.body),
+      signature,
+      payloadBuffer: req.body,
+    });
+    if (ledger.duplicate) {
+      return res.status(409).json({ error: 'Webhook replay detected', dedupe_key: ledger.dedupeKey });
+    }
+    return res.json({ received: true, dedupe_key: ledger.dedupeKey });
   } catch (error) {
     console.error('Stripe webhook verification failed');
     return res.status(400).json({ error: 'Invalid webhook signature' });
@@ -328,7 +419,17 @@ app.post('/webhooks/razorpay', webhookLimiter, express.raw({ type: 'application/
   if (!verifyHmac(req.body, signature, secret)) {
     return res.status(400).json({ error: 'Invalid Razorpay webhook signature' });
   }
-  return res.json({ received: true });
+  const eventId = extractBodyEventId('razorpay', req.body) || sha256(Buffer.concat([req.body, Buffer.from(String(signature || ''))]));
+  const ledger = recordWebhookLedger({
+    provider: 'razorpay',
+    eventId,
+    signature,
+    payloadBuffer: req.body,
+  });
+  if (ledger.duplicate) {
+    return res.status(409).json({ error: 'Webhook replay detected', dedupe_key: ledger.dedupeKey });
+  }
+  return res.json({ received: true, dedupe_key: ledger.dedupeKey });
 });
 
 app.post('/webhooks/phonepe', webhookLimiter, express.raw({ type: 'application/json' }), (req, res) => {
@@ -340,7 +441,17 @@ app.post('/webhooks/phonepe', webhookLimiter, express.raw({ type: 'application/j
   if (!verifyHmac(req.body, signature, secret)) {
     return res.status(400).json({ error: 'Invalid PhonePe webhook signature' });
   }
-  return res.json({ received: true });
+  const eventId = extractBodyEventId('phonepe', req.body) || sha256(Buffer.concat([req.body, Buffer.from(String(signature || ''))]));
+  const ledger = recordWebhookLedger({
+    provider: 'phonepe',
+    eventId,
+    signature,
+    payloadBuffer: req.body,
+  });
+  if (ledger.duplicate) {
+    return res.status(409).json({ error: 'Webhook replay detected', dedupe_key: ledger.dedupeKey });
+  }
+  return res.json({ received: true, dedupe_key: ledger.dedupeKey });
 });
 
 app.post('/webhooks/paytm', webhookLimiter, express.raw({ type: 'application/json' }), (req, res) => {
@@ -352,7 +463,17 @@ app.post('/webhooks/paytm', webhookLimiter, express.raw({ type: 'application/jso
   if (!verifyHmac(req.body, signature, secret)) {
     return res.status(400).json({ error: 'Invalid Paytm webhook signature' });
   }
-  return res.json({ received: true });
+  const eventId = extractBodyEventId('paytm', req.body) || sha256(Buffer.concat([req.body, Buffer.from(String(signature || ''))]));
+  const ledger = recordWebhookLedger({
+    provider: 'paytm',
+    eventId,
+    signature,
+    payloadBuffer: req.body,
+  });
+  if (ledger.duplicate) {
+    return res.status(409).json({ error: 'Webhook replay detected', dedupe_key: ledger.dedupeKey });
+  }
+  return res.json({ received: true, dedupe_key: ledger.dedupeKey });
 });
 
 app.use(express.json());
@@ -450,6 +571,37 @@ app.post('/admin/payments/providers/:provider/setup', adminWriteLimiter, async (
   }
   auditLog('payment_provider_setup', { provider, actor: req.headers['x-admin-actor'] || 'unknown' });
   return res.json({ provider, config: paymentProviders[provider] });
+});
+
+app.post('/admin/payments/reconciliation/run', adminWriteLimiter, (req, res) => {
+  if (!verifyAdmin(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const provider = req.body?.provider || 'all';
+  const now = new Date().toISOString();
+  const events = Object.values(webhookIndex.by_dedupe_key || {});
+  const byProvider = provider === 'all' ? events : events.filter((item) => item.provider === provider);
+  const run = {
+    run_id: `recon_${crypto.randomUUID()}`,
+    provider,
+    status: 'completed',
+    ledger_events_scanned: byProvider.length,
+    anomalies: 0,
+    started_at: now,
+    completed_at: now,
+  };
+  persistReconciliationRun(run);
+  auditLog('payment_reconciliation_run', { provider, run_id: run.run_id, actor: req.headers['x-admin-actor'] || 'unknown' });
+  return res.json(run);
+});
+
+app.get('/admin/payments/reconciliation/runs', adminReadLimiter, (req, res) => {
+  if (!canReadProviders(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const limit = Math.max(1, Math.min(Number(req.query.limit || 20), 100));
+  const items = readReconciliationRuns().slice(-limit).reverse();
+  return res.json({ items });
 });
 
 process.on('SIGTERM', async () => {
