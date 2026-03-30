@@ -48,6 +48,16 @@ TARGETS = {
     "whatsapp": os.getenv("WHATSAPP_SERVICE_URL", "http://whatsapp_service:3002"),
     "crm": os.getenv("CRM_SERVICE_URL", "http://crm:8070"),
 }
+SERVICE_IDENTITIES = {
+    "auth": "spiffe://email-warmup/auth",
+    "leads": "spiffe://email-warmup/lead-service",
+    "warmup": "spiffe://email-warmup/warmup-engine",
+    "verification": "spiffe://email-warmup/verification-engine",
+    "ai": "spiffe://email-warmup/ai-agent",
+    "billing": "spiffe://email-warmup/billing-service",
+    "whatsapp": "spiffe://email-warmup/whatsapp-service",
+    "crm": "spiffe://email-warmup/crm",
+}
 
 OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
@@ -79,6 +89,10 @@ async def proxy(request: Request, service: str, path: str) -> dict | str:
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     request_id = getattr(request.state, "request_id", request.headers.get("x-request-id", str(uuid.uuid4())))
     headers["x-request-id"] = request_id
+    headers["x-caller-service"] = "gateway"
+    headers["x-caller-identity"] = "spiffe://email-warmup/gateway"
+    headers["x-target-service"] = service
+    headers["x-target-identity"] = SERVICE_IDENTITIES.get(service, "spiffe://email-warmup/unknown")
     if request.headers.get("traceparent"):
         headers["traceparent"] = request.headers["traceparent"]
     if request.headers.get("tracestate"):
@@ -111,13 +125,31 @@ async def otel_gateway_middleware(request: Request, call_next):
         with TRACER.start_as_current_span(f"gateway {request.method} {request.url.path}") as span:
             span.set_attribute("http.method", request.method)
             span.set_attribute("http.route", request.url.path)
+            span.set_attribute("service.identity", "spiffe://email-warmup/gateway")
             response = await call_next(request)
             span.set_attribute("http.status_code", response.status_code)
     else:
         response = await call_next(request)
     response.headers["x-request-id"] = request.state.request_id
+    response.headers["x-correlation-id"] = request.state.request_id
     response.headers["x-gateway-latency-ms"] = str(round((time.perf_counter() - start) * 1000, 2))
     return response
+
+
+@app.post("/policy/authorize")
+async def policy_authorize(request: Request) -> dict:
+    body = await request.json()
+    auth_url = f"{TARGETS['auth']}/authorize"
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(auth_url, json=body)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+    return response.json()
+
+
+@app.post("/policy/consensus")
+async def policy_consensus() -> dict:
+    return {"consensus_decision": "adopt", "confidence": 0.0, "sources": []}
 
 
 @app.api_route("/auth/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

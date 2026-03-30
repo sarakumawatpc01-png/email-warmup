@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import httpx
 import jwt
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import PlainTextResponse
@@ -67,6 +68,10 @@ SERVICE_NAME = "warmup-engine"
 ADMIN_API_KEY = os.getenv("WARMUP_ADMIN_API_KEY", "")
 AUTH_JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 AUTH_JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+AUTH_POLICY_URL = os.getenv("AUTH_POLICY_URL", "").rstrip("/")
+POLICY_ENGINE_URL = os.getenv("POLICY_ENGINE_URL", "").rstrip("/")
+POLICY_ENGINE_ADAPTER = os.getenv("POLICY_ENGINE_ADAPTER", "local")
+SERVICE_SPIFFE_ID = os.getenv("WARMUP_SERVICE_SPIFFE_ID", "spiffe://email-warmup/warmup-engine")
 
 def init_engine():
     try:
@@ -384,6 +389,30 @@ class WorkerLease(Base):
     )
 
 
+class ApprovalRequest(Base):
+    __tablename__ = "approval_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    resource_type: Mapped[str] = mapped_column(String(120), index=True)
+    resource_id: Mapped[str] = mapped_column(String(255), index=True)
+    action: Mapped[str] = mapped_column(String(120), index=True)
+    requested_by: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    approvals: Mapped[int] = mapped_column(Integer, default=0)
+    required_approvals: Mapped[int] = mapped_column(Integer, default=2)
+    details: Mapped[str] = mapped_column(String, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_approval_requests_status_created", "status", "created_at"),
+    )
+
+
 Base.metadata.create_all(engine)
 
 if trace and TracerProvider and BatchSpanProcessor:
@@ -459,6 +488,7 @@ class KillSwitchRequest(BaseModel):
     scope: Literal["global", "tenant", "provider"]
     enabled: bool
     value: str | None = None
+    approval_request_id: int | None = None
 
 
 class AbuseCheckRequest(BaseModel):
@@ -491,6 +521,17 @@ class InboxRecordRequest(BaseModel):
     source: str = Field(min_length=2, max_length=120)
     message_id: str = Field(min_length=8, max_length=160)
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalRequestCreate(BaseModel):
+    resource_type: str = Field(min_length=2, max_length=120)
+    resource_id: str = Field(min_length=1, max_length=255)
+    action: str = Field(min_length=2, max_length=120)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalDecisionRequest(BaseModel):
+    approval_request_id: int = Field(ge=1)
 
 
 def provider_profile_for_mailbox(mailbox: str) -> dict[str, float]:
@@ -530,6 +571,39 @@ def extract_token_claims(authorization: str | None) -> dict[str, Any]:
     return claims if isinstance(claims, dict) else {}
 
 
+def policy_check(
+    authorization: str | None,
+    *,
+    action: str,
+    resource: str,
+    tenant_scope: str | None = None,
+) -> bool:
+    if not authorization:
+        return False
+    claims = extract_token_claims(authorization)
+    if claims.get("sid") or claims.get("jti"):
+        if AUTH_POLICY_URL:
+            try:
+                token = authorization.removeprefix("Bearer ").strip()
+                response = httpx.post(
+                    f"{AUTH_POLICY_URL}/authorize",
+                    json={
+                        "token": token,
+                        "action": action,
+                        "resource": resource,
+                        "tenant_scope": tenant_scope,
+                    },
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    return bool(data.get("allowed"))
+                return False
+            except Exception:
+                return False
+    return _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+
+
 def _has_permission(claims: dict[str, Any], permission: str) -> bool:
     permissions = claims.get("permissions") or []
     if not isinstance(permissions, list):
@@ -547,7 +621,8 @@ def require_admin(
     claims: dict[str, Any] = {}
     if authorization:
         claims = extract_token_claims(authorization)
-        if not _has_permission(claims, permission):
+        resource, action = permission.split(":", 1) if ":" in permission else (permission, "admin")
+        if not policy_check(authorization, action=action, resource=resource, tenant_scope=tenant_scope):
             raise HTTPException(status_code=403, detail="Permission denied")
         if tenant_scope and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_scope:
             raise HTTPException(status_code=403, detail="Tenant scope denied")
@@ -574,9 +649,54 @@ def write_admin_audit_log(
             action=action,
             resource_type=resource_type,
             resource_id=resource_id,
-            details=json.dumps(details or {}),
+            details=json.dumps(
+                {
+                    "service_identity": SERVICE_SPIFFE_ID,
+                    **(details or {}),
+                }
+            ),
         )
     )
+
+
+def resolve_policy_decision(profile: MailboxProfile, risk: float, blacklist_detected: bool) -> tuple[int, str, str]:
+    if POLICY_ENGINE_ADAPTER == "remote" and POLICY_ENGINE_URL:
+        try:
+            payload = {
+                "tenant_id": profile.tenant_id,
+                "mailbox": profile.mailbox,
+                "risk": risk,
+                "blacklist_detected": blacklist_detected,
+                "current_daily_target": profile.current_daily_target,
+                "mode": profile.mode,
+            }
+            response = httpx.post(f"{POLICY_ENGINE_URL}/decide", json=payload, timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                candidate = int(data.get("daily_target", profile.current_daily_target))
+                mode = str(data.get("mode", profile.mode))
+                return int(clamp(candidate, 1, MAX_MAILBOX_DAILY_CAP)), mode, "remote"
+        except Exception:
+            pass
+    candidate, mode = apply_adaptive_policy(profile, risk, blacklist_detected)
+    return candidate, mode, "local"
+
+
+def requires_dual_control(scope: str) -> bool:
+    return scope in {"global", "tenant", "provider"}
+
+
+def approval_ready(session: Session, approval_request_id: int | None, *, action: str, resource_type: str) -> bool:
+    if not approval_request_id:
+        return False
+    req = session.get(ApprovalRequest, approval_request_id)
+    if not req:
+        return False
+    if req.action != action or req.resource_type != resource_type:
+        return False
+    if req.status != "approved":
+        return False
+    return True
 
 
 def ensure_outbox_event(session: Session, *, topic: str, dedupe_key: str, payload: dict[str, Any]) -> OutboxEvent:
