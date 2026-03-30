@@ -378,8 +378,9 @@ def test_warmup_visibility_timeout_sweeper_and_lease_renew():
     event_id = enqueue.json()["event_id"]
 
     inflight_key = f"send_execution:{event_id}"
-    warmup_module = sys.modules[warmup_app.__module__]
-    warmup_module.IN_MEMORY_INFLIGHT[inflight_key] = {
+    inflight_route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/worker/inflight")
+    warmup_state = inflight_route.endpoint.__globals__
+    warmup_state["IN_MEMORY_INFLIGHT"][inflight_key] = {
         "task": {
             "event_id": event_id,
             "queue_name": "send_execution",
@@ -390,7 +391,7 @@ def test_warmup_visibility_timeout_sweeper_and_lease_renew():
             "mailbox": "lease@example.com",
         },
         "queue_name": "send_execution",
-        "lease_until": warmup_module.utc_now() - warmup_module.timedelta(seconds=5),
+        "lease_until": warmup_state["utc_now"]() - warmup_state["timedelta"](seconds=5),
     }
 
     sweep = client.post("/warmup/worker/sweep-stuck")
