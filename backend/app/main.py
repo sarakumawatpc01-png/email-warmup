@@ -3,11 +3,16 @@ import time
 import uuid
 import hmac
 import hashlib
+import logging
+from collections import defaultdict, deque
+from threading import Lock
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
+
+logger = logging.getLogger("backend-gateway")
 
 try:
     from opentelemetry import trace
@@ -16,7 +21,8 @@ try:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-except Exception:  # pragma: no cover - optional runtime capability
+except ImportError as exc:  # pragma: no cover - optional runtime capability
+    logger.warning("OpenTelemetry unavailable; tracing disabled: %s", exc)
     trace = None
     OTLPSpanExporter = None
     FastAPIInstrumentor = None
@@ -66,10 +72,59 @@ OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
 GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signing-secret")
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev").lower()
+GATEWAY_MAX_REQUEST_BYTES = int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", str(10 * 1024 * 1024)))
+SECRETS_MANAGER_URL = os.getenv("SECRETS_MANAGER_URL", "").rstrip("/")
+SECRETS_MANAGER_TOKEN = os.getenv("SECRETS_MANAGER_TOKEN", "")
+GATEWAY_ADMIN_RATE_LIMIT = int(os.getenv("GATEWAY_ADMIN_RATE_LIMIT", "30"))
+GATEWAY_ADMIN_RATE_WINDOW_SECONDS = int(os.getenv("GATEWAY_ADMIN_RATE_WINDOW_SECONDS", "60"))
+_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+_RATE_LIMIT_LOCK = Lock()
 
 
 def _is_non_production_env() -> bool:
     return DEPLOY_ENV in {"dev", "test", "local"}
+
+
+def _resolve_secret(env_name: str, default: str) -> str:
+    value = os.getenv(env_name)
+    if value and not value.startswith("sm://"):
+        return value
+    secret_name = value.removeprefix("sm://") if value else env_name
+    if not SECRETS_MANAGER_URL:
+        return default
+    try:
+        headers = {}
+        if SECRETS_MANAGER_TOKEN:
+            headers["authorization"] = f"Bearer {SECRETS_MANAGER_TOKEN}"
+        with httpx.Client(timeout=3) as client:
+            response = client.get(f"{SECRETS_MANAGER_URL}/v1/secrets/{secret_name}", headers=headers)
+        if response.status_code != 200:
+            return default
+        payload = response.json()
+        resolved = payload.get("value")
+        return resolved if isinstance(resolved, str) and resolved else default
+    except Exception:
+        logger.warning("secret resolution failed for %s", env_name)
+        return default
+
+
+def _rate_limit_key(request: Request) -> str:
+    request_id = request.headers.get("x-admin-actor") or request.headers.get("x-caller-service")
+    if request_id:
+        return request_id.strip().lower()
+    return (request.client.host if request.client else "unknown").strip().lower()
+
+
+def _is_rate_limit_allowed(key: str, limit: int, window_seconds: int) -> bool:
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS[key]
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            return False
+        bucket.append(now)
+        return True
 
 
 def _enforce_runtime_secrets() -> None:
@@ -115,6 +170,8 @@ async def proxy(request: Request, service: str, path: str) -> Response:
     if request.headers.get("tracestate"):
         headers["tracestate"] = request.headers["tracestate"]
     body = await request.body()
+    if len(body) > GATEWAY_MAX_REQUEST_BYTES:
+        raise HTTPException(status_code=413, detail="Request body too large")
     signed_at = str(int(time.time()))
     canonical = "|".join(
         [
@@ -163,6 +220,17 @@ async def proxy(request: Request, service: str, path: str) -> Response:
 
 @app.middleware("http")
 async def otel_gateway_middleware(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > GATEWAY_MAX_REQUEST_BYTES:
+                return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
+    if request.url.path.startswith("/policy/"):
+        key = f"policy:{_rate_limit_key(request)}"
+        if not _is_rate_limit_allowed(key, GATEWAY_ADMIN_RATE_LIMIT, GATEWAY_ADMIN_RATE_WINDOW_SECONDS):
+            return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
     start = time.perf_counter()
     request.state.request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     if TRACER:
@@ -192,7 +260,10 @@ async def policy_authorize(request: Request) -> dict:
 
 
 @app.post("/policy/consensus")
-async def policy_consensus() -> dict:
+async def policy_consensus(request: Request) -> dict:
+    caller_service = request.headers.get("x-caller-service", "").strip().lower()
+    if caller_service not in TARGETS:
+        raise HTTPException(status_code=403, detail="Forbidden")
     return {"consensus_decision": "adopt", "confidence": 0.0, "sources": []}
 
 
@@ -236,4 +307,5 @@ async def crm_proxy(request: Request, path: str = ""):
     return await proxy(request, "crm", path)
 
 
+GATEWAY_SIGNING_SECRET = _resolve_secret("GATEWAY_SIGNING_SECRET", GATEWAY_SIGNING_SECRET)
 _enforce_runtime_secrets()

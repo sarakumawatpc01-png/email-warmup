@@ -48,6 +48,8 @@ const eventOutboxPath = process.env.BILLING_OUTBOX_STATE_PATH || path.resolve('d
 const reconciliationQueuePath = process.env.BILLING_RECON_QUEUE_PATH || path.resolve('data/reconciliation-queue.json');
 const reconciliationDlqPath = process.env.BILLING_RECON_DLQ_PATH || path.resolve('data/reconciliation-dlq.json');
 const webhookNonceIndexPath = process.env.BILLING_WEBHOOK_NONCE_INDEX_PATH || path.resolve('data/webhook-nonce-index.json');
+const auditLogPath = process.env.BILLING_AUDIT_LOG_PATH || path.resolve('data/audit-logs.json');
+const auditRetentionDays = Number(process.env.BILLING_AUDIT_RETENTION_DAYS || 90);
 const webhookTimestampToleranceSeconds = Number(process.env.BILLING_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS || 300);
 const webhookNonceTtlSeconds = Number(process.env.BILLING_WEBHOOK_NONCE_TTL_SECONDS || 900);
 const reconciliationMaxAttempts = Number(process.env.BILLING_RECONCILIATION_MAX_ATTEMPTS || 5);
@@ -288,7 +290,18 @@ function canReadProviders(req) {
 }
 
 function auditLog(event, details = {}) {
-  console.log(JSON.stringify({ event, ...details, at: new Date().toISOString() }));
+  const entry = {
+    event,
+    actor: details.actor || 'system',
+    resource_type: details.resource_type || 'billing',
+    resource_id: details.resource_id || '',
+    details,
+    at: new Date().toISOString(),
+  };
+  auditLogsState.items.push(entry);
+  auditLogsState.items = auditLogsState.items.slice(-5000);
+  persistAuditLogsState();
+  console.log(JSON.stringify(entry));
 }
 
 function buildAuditContext(req) {
@@ -388,6 +401,7 @@ let eventOutbox = loadJsonFile(eventOutboxPath, { items: [] });
 let reconciliationQueue = loadJsonFile(reconciliationQueuePath, { items: [] });
 let reconciliationDlq = loadJsonFile(reconciliationDlqPath, { items: [] });
 let webhookNonceIndex = loadJsonFile(webhookNonceIndexPath, { by_provider: {} });
+let auditLogsState = loadJsonFile(auditLogPath, { items: [] });
 
 function persistOrdersState() {
   writeJsonFile(ordersStatePath, ordersState);
@@ -427,6 +441,10 @@ function persistReconciliationDlqState() {
 
 function persistWebhookNonceState() {
   writeJsonFile(webhookNonceIndexPath, webhookNonceIndex);
+}
+
+function persistAuditLogsState() {
+  writeJsonFile(auditLogPath, auditLogsState);
 }
 
 function nowIso() {
@@ -1274,6 +1292,77 @@ app.get('/admin/payments/reconciliation/runs', adminReadLimiter, (req, res) => {
   const limit = Math.max(1, Math.min(Number(req.query.limit || 20), 100));
   const items = readReconciliationRuns().slice(-limit).reverse();
   return res.json({ items });
+});
+
+app.get('/admin/audit-logs', adminReadLimiter, (req, res) => {
+  if (!canReadProviders(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const limit = Math.max(1, Math.min(Number(req.query.limit || 100), 500));
+  const actor = req.query.actor ? String(req.query.actor) : '';
+  const action = req.query.action ? String(req.query.action) : '';
+  const resourceType = req.query.resource_type ? String(req.query.resource_type) : '';
+  const since = req.query.since ? String(req.query.since) : '';
+  const sinceTs = since ? Date.parse(since) : null;
+  if (since && Number.isNaN(sinceTs)) {
+    return res.status(400).json({ error: 'Invalid since timestamp' });
+  }
+  const items = (auditLogsState.items || [])
+    .filter((item) => !actor || item.actor === actor)
+    .filter((item) => !action || item.event === action)
+    .filter((item) => !resourceType || item.resource_type === resourceType)
+    .filter((item) => !sinceTs || Date.parse(item.at) >= sinceTs)
+    .slice(-limit)
+    .reverse();
+  return res.json({ items });
+});
+
+app.get('/admin/audit-logs/export', adminReadLimiter, (req, res) => {
+  if (!canReadProviders(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const limit = Math.max(1, Math.min(Number(req.query.limit || 200), 1000));
+  const items = (auditLogsState.items || []).slice(-limit).reverse();
+  const safeCsv = (value) => {
+    const text = String(value || '');
+    if (['=', '+', '-', '@', '\t'].some((prefix) => text.startsWith(prefix))) {
+      return `'${text}`;
+    }
+    return text;
+  };
+  const header = 'at,actor,event,resource_type,resource_id,details';
+  const rows = items.map((item) => {
+    const details = safeCsv(JSON.stringify(item.details || {})).replaceAll('"', '""');
+    return `"${safeCsv(item.at)}","${safeCsv(item.actor)}","${safeCsv(item.event)}","${safeCsv(item.resource_type)}","${safeCsv(item.resource_id)}","${details}"`;
+  });
+  res.setHeader('content-type', 'text/csv');
+  res.setHeader('content-disposition', 'attachment; filename=billing-audit-logs.csv');
+  return res.send(`${header}\n${rows.join('\n')}`);
+});
+
+app.post('/admin/audit-logs/retention', adminWriteLimiter, (req, res) => {
+  if (!verifyAdmin(req)) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  const dryRun = Boolean(req.body?.dry_run);
+  const retentionDays = Math.max(1, Number(req.body?.retention_days || auditRetentionDays));
+  const cutoffMs = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
+  const existing = auditLogsState.items || [];
+  const staleCount = existing.filter((item) => Date.parse(item.at) < cutoffMs).length;
+  if (!dryRun && staleCount > 0) {
+    auditLogsState.items = existing.filter((item) => Date.parse(item.at) >= cutoffMs);
+    persistAuditLogsState();
+  }
+  auditLog('billing_audit_retention_enforced', {
+    actor: req.headers['x-admin-actor'] || 'unknown',
+    resource_type: 'audit',
+    resource_id: 'billing',
+    dry_run: dryRun,
+    retention_days: retentionDays,
+    deleted: staleCount,
+    ...buildAuditContext(req),
+  });
+  return res.json({ deleted: staleCount, dry_run: dryRun, retention_days: retentionDays });
 });
 
 process.on('SIGTERM', async () => {
