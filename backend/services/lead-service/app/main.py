@@ -82,7 +82,7 @@ def parse_token(authorization: str = Header(default="")) -> dict:
 def _is_revoked(claims: dict) -> bool:
     sid = claims.get("sid")
     jti = claims.get("jti")
-    if not isinstance(sid, str) and not isinstance(jti, str):
+    if not isinstance(sid, str) or not isinstance(jti, str):
         return False
     try:
         with sqlite3.connect(AUTH_STATE_DB_PATH) as conn:

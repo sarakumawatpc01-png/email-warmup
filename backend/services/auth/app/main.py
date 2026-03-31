@@ -369,7 +369,10 @@ def refresh_token(payload: RefreshRequest) -> dict:
     if not isinstance(sid, str) or not isinstance(jti, str):
         raise HTTPException(status_code=401, detail="Invalid refresh token claims")
     current_jti = refresh_sessions.get(sid)
-    if sid in revoked_session_ids or (jti in revoked_token_ids and current_jti == jti):
+    if sid in revoked_session_ids:
+        raise HTTPException(status_code=401, detail="Session revoked")
+    if jti in revoked_token_ids:
+        _revoke_sid(sid)
         raise HTTPException(status_code=401, detail="Session revoked")
     if current_jti != jti:
         _revoke_sid(sid)

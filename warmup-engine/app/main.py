@@ -78,6 +78,7 @@ GATEWAY_IDENTITY = os.getenv("GATEWAY_SPIFFE_ID", "spiffe://email-warmup/gateway
 GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signing-secret")
 GATEWAY_SIGNATURE_MAX_AGE_SECONDS = int(os.getenv("GATEWAY_SIGNATURE_MAX_AGE_SECONDS", "300"))
 AUTHZ_CACHE_TTL_SECONDS = int(os.getenv("AUTHZ_CACHE_TTL_SECONDS", "5"))
+AUTHZ_CACHE_MAX_ENTRIES = int(os.getenv("AUTHZ_CACHE_MAX_ENTRIES", "2048"))
 
 def init_engine():
     try:
@@ -625,12 +626,20 @@ def _validate_gateway_service_headers(
 
 
 class _AuthzCache:
-    def __init__(self, ttl_seconds: int) -> None:
+    def __init__(self, ttl_seconds: int, max_entries: int) -> None:
         self.ttl_seconds = max(1, ttl_seconds)
+        self.max_entries = max(64, max_entries)
         self._store: dict[str, tuple[float, bool]] = {}
 
     def _key(self, token: str, action: str, resource: str, tenant_scope: str | None) -> str:
-        return "|".join([token, action, resource, tenant_scope or ""])
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return "|".join([token_hash, action, resource, tenant_scope or ""])
+
+    def _purge_expired(self) -> None:
+        now = time.time()
+        expired = [key for key, item in self._store.items() if item[0] < now]
+        for key in expired:
+            self._store.pop(key, None)
 
     def get(self, token: str, action: str, resource: str, tenant_scope: str | None) -> bool | None:
         key = self._key(token, action, resource, tenant_scope)
@@ -644,11 +653,14 @@ class _AuthzCache:
         return value
 
     def set(self, token: str, action: str, resource: str, tenant_scope: str | None, value: bool) -> None:
+        self._purge_expired()
+        if len(self._store) >= self.max_entries:
+            self._store.pop(next(iter(self._store)), None)
         key = self._key(token, action, resource, tenant_scope)
         self._store[key] = (time.time() + self.ttl_seconds, value)
 
 
-AUTHZ_CACHE = _AuthzCache(AUTHZ_CACHE_TTL_SECONDS)
+AUTHZ_CACHE = _AuthzCache(AUTHZ_CACHE_TTL_SECONDS, AUTHZ_CACHE_MAX_ENTRIES)
 
 
 def policy_check(

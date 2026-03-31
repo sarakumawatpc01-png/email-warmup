@@ -151,7 +151,7 @@ def test_auth_refresh_replay_detection_revokes_session():
 
     replay = client.post("/token/refresh", json={"refresh_token": refresh_token})
     assert replay.status_code == 401
-    assert replay.json()["detail"] == "Refresh replay detected"
+    assert replay.json()["detail"] == "Session revoked"
 
     post_replay = client.post("/token/refresh", json={"refresh_token": first.json()["refresh_token"]})
     assert post_replay.status_code == 401
@@ -861,6 +861,9 @@ def test_gateway_proxy_adds_signature_headers_for_service_calls():
             return False
 
         async def request(self, method, url, headers, params, content):
+            assert method == "GET"
+            assert "/admin/audit-logs" in url
+            assert params == {}
             captured["headers"] = headers
             return FakeResponse()
 
