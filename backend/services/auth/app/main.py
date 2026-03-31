@@ -174,8 +174,8 @@ def _policy_allows(claims: dict[str, Any], action: str, resource: str, tenant_sc
         and claims.get("tenant_id") != tenant_scope
     ):
         return False
-    matrix_key = f"{action}.{resource}"
-    allowed = POLICY_MATRIX.get(matrix_key, POLICY_MATRIX.get(f"{resource}.{action}", []))
+    matrix_key = f"{resource}.{action}"
+    allowed = POLICY_MATRIX.get(matrix_key, [])
     return "*" in permissions or any(scope in permissions for scope in allowed)
 
 

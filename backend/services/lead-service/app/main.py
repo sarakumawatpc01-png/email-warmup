@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from typing import Optional
+import logging
 
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -15,6 +16,7 @@ AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 app = FastAPI(title="Lead Service", version="1.0.0")
+logger = logging.getLogger("lead-service")
 
 
 class Base(DeclarativeBase):
@@ -93,7 +95,8 @@ def _is_revoked(claims: dict) -> bool:
                 if row:
                     return True
     except sqlite3.Error:
-        return False
+        logger.warning("auth_state_db_unavailable", exc_info=True)
+        return True
     return False
 
 

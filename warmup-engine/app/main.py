@@ -1936,8 +1936,6 @@ def list_internal_mailboxes(
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
     )
-    if tenant_id and claims and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant scope denied")
     with Session(engine) as session:
         stmt = select(InternalMailbox)
         if tenant_id:
@@ -1975,8 +1973,6 @@ def mailbox_health(
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
     )
-    if claims and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_id:
-        raise HTTPException(status_code=403, detail="Tenant scope denied")
     mailbox_normalized = mailbox.lower()
     capped_limit = max(1, min(limit, 100))
     with Session(engine) as session:
