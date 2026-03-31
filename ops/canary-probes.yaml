@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: email-warmup-canary-probes
+data:
+  probes.yaml: |
+    probes:
+      - name: gateway-health
+        interval_seconds: 30
+        method: GET
+        url: http://backend:8000/health
+        expect_status: 200
+      - name: warmup-schedule
+        interval_seconds: 60
+        method: POST
+        url: http://warmup_engine:8003/warmup/schedule/generate
+        headers:
+          Content-Type: application/json
+        body:
+          tenant_id: canary-tenant
+          mailbox: canary@gmail.com
+          requested_count: 3
+          partner_pool:
+            - seed-1@warmup.local
+            - seed-2@warmup.local
+        expect_status: 200
+      - name: billing-health
+        interval_seconds: 30
+        method: GET
+        url: http://billing_service:3001/health
+        expect_status: 200

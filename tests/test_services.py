@@ -877,6 +877,82 @@ def test_gateway_proxy_adds_signature_headers_for_service_calls():
         gateway_state["httpx"].AsyncClient = original_client
 
 
+def test_warmup_phase_h_foundation_endpoints():
+    client = TestClient(warmup_app)
+    tenant = f"tenant-h-{uuid.uuid4().hex[:6]}"
+    mailbox = f"h-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    seed = client.post(
+        "/warmup/seed-mailboxes/ingest",
+        json={
+            "provider": "gmail",
+            "folder": "inbox",
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "message_ids": ["m1", "m2"],
+        },
+    )
+    assert seed.status_code == 200
+    assert seed.json()["processed"] == 2
+
+    feed = client.post(
+        "/warmup/reputation/feeds/ingest",
+        json={
+            "provider": "gmail",
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "listed": True,
+            "source": "rbl-test",
+            "confidence": 0.8,
+        },
+    )
+    assert feed.status_code == 200
+    assert feed.json()["listed"] is True
+
+    fingerprint = client.post(
+        "/warmup/content/fingerprint",
+        json={"tenant_id": tenant, "mailbox": mailbox, "subject": "Hello", "body": "Warmup content"},
+    )
+    assert fingerprint.status_code == 200
+    assert len(fingerprint.json()["fingerprint"]) == 64
+
+    control = client.post(
+        "/warmup/slo/control-loop",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "provider": "gmail",
+            "send_success_ratio": 0.7,
+            "placement_score": 0.6,
+            "queue_latency_seconds": 180,
+        },
+    )
+    assert control.status_code == 200
+    assert control.json()["mode"] == "throttle"
+
+
+def test_billing_service_phase_g_lifecycle_endpoints():
+    billing_src = (ROOT / "billing-service/src/index.js").read_text(encoding="utf-8")
+    assert "app.post('/orders'" in billing_src
+    assert "app.get('/orders/:orderId'" in billing_src
+    assert "app.get('/orders'" in billing_src
+    assert "app.post('/orders/:orderId/cancel'" in billing_src
+    assert "app.post('/subscriptions/start'" in billing_src
+    assert "app.post('/subscriptions/:tenantId/upgrade'" in billing_src
+    assert "app.post('/subscriptions/:tenantId/downgrade'" in billing_src
+    assert "app.post('/subscriptions/:tenantId/cancel'" in billing_src
+    assert "app.post('/orders/:orderId/refunds'" in billing_src
+    assert "app.post('/orders/:orderId/disputes'" in billing_src
+
+
+def test_billing_webhook_nonce_and_replay_guardrails():
+    billing_src = (ROOT / "billing-service/src/index.js").read_text(encoding="utf-8")
+    assert "x-webhook-timestamp" in billing_src
+    assert "x-webhook-nonce" in billing_src
+    assert "Webhook nonce replay detected" in billing_src
+    assert "Webhook timestamp outside tolerance window" in billing_src
+
+
 _MAILBOX_STRATEGY = st.builds(
     lambda local, domain: f"{local}@{domain}",
     local=st.text(

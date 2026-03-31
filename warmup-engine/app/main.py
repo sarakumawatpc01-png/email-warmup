@@ -491,6 +491,39 @@ class ContentPlanRequest(BaseModel):
     day_number: int = Field(ge=1, le=365)
 
 
+class SeedMailboxIngestRequest(BaseModel):
+    provider: str = Field(min_length=2, max_length=120)
+    folder: str = Field(min_length=2, max_length=120)
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    message_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+class ReputationFeedIngestRequest(BaseModel):
+    provider: str = Field(min_length=2, max_length=120)
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    listed: bool = False
+    source: str = Field(default="internal", min_length=2, max_length=120)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class ContentFingerprintRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    subject: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=5000)
+
+
+class SloControlLoopRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    provider: str = Field(min_length=2, max_length=120)
+    send_success_ratio: float = Field(ge=0.0, le=1.0)
+    placement_score: float = Field(ge=0.0, le=1.0)
+    queue_latency_seconds: float = Field(ge=0.0)
+
+
 class KillSwitchRequest(BaseModel):
     scope: Literal["global", "tenant", "provider"]
     enabled: bool
@@ -1206,13 +1239,20 @@ def metrics_prometheus() -> Response:
 @app.middleware("http")
 async def prometheus_http_middleware(request: Request, call_next):
     if not PROMETHEUS_ENABLED:
-        return await call_next(request)
+        response = await call_next(request)
+        request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+        response.headers["x-request-id"] = request_id
+        response.headers["x-correlation-id"] = request_id
+        return response
 
     path = request.url.path
     method = request.method
     start = time.perf_counter()
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    request.state.request_id = request_id
     if TRACER:
         with TRACER.start_as_current_span(f"http {method} {path}"):
+            trace.get_current_span().set_attribute("correlation.id", request_id)
             response = await call_next(request)
     else:
         response = await call_next(request)
@@ -1224,6 +1264,8 @@ async def prometheus_http_middleware(request: Request, call_next):
     PROM_HTTP_REQUESTS_TOTAL.labels(
         service=SERVICE_NAME, env=DEPLOY_ENV, method=method, path=path, status_code=str(response.status_code)
     ).inc()
+    response.headers["x-request-id"] = request_id
+    response.headers["x-correlation-id"] = request_id
     return response
 
 
@@ -1866,6 +1908,141 @@ def content_plan(payload: ContentPlanRequest) -> dict:
             "bounded_mutation": True,
             "max_template_similarity": 0.86,
         },
+    }
+
+
+@app.post("/warmup/seed-mailboxes/ingest")
+def ingest_seed_mailbox(payload: SeedMailboxIngestRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    provider = payload.provider.lower()
+    folder = payload.folder.lower()
+    processed = len(payload.message_ids)
+    sample = payload.message_ids[:5]
+    digest = hashlib.sha256("|".join(sorted(payload.message_ids)).encode("utf-8")).hexdigest() if payload.message_ids else ""
+    json_log(
+        "seed_mailbox_ingested",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        provider=provider,
+        folder=folder,
+        processed=processed,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "provider": provider,
+        "folder": folder,
+        "processed": processed,
+        "message_id_sample": sample,
+        "content_digest": digest,
+    }
+
+
+@app.post("/warmup/reputation/feeds/ingest")
+def ingest_reputation_feed(payload: ReputationFeedIngestRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    provider = payload.provider.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+        risk_delta = 0.2 * payload.confidence if payload.listed else -0.08 * payload.confidence
+        risk = clamp(profile.risk_score + risk_delta, 0.0, 1.0)
+        profile.risk_score = risk
+        profile.reputation_score = clamp(1 - risk, 0.0, 1.0)
+        profile.mode = "throttle" if payload.listed else profile.mode
+        profile.updated_at = utc_now()
+        session.add(
+            RiskSignal(
+                tenant_id=payload.tenant_id,
+                mailbox=mailbox,
+                signal_type="blacklist_feed",
+                severity=risk,
+                details=json.dumps(
+                    {
+                        "provider": provider,
+                        "source": payload.source,
+                        "listed": payload.listed,
+                        "confidence": payload.confidence,
+                    }
+                ),
+            )
+        )
+        session.commit()
+    json_log(
+        "reputation_feed_ingested",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        provider=provider,
+        listed=payload.listed,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "provider": provider,
+        "listed": payload.listed,
+        "risk_score": round(risk, 4),
+    }
+
+
+@app.post("/warmup/content/fingerprint")
+def content_fingerprint(payload: ContentFingerprintRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    canonical = f"{payload.subject.strip().lower()}|{payload.body.strip().lower()}"
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    variant_seed = int(fingerprint[:8], 16) % 7
+    adaptive_hint = f"variant-{variant_seed + 1}"
+    json_log(
+        "content_fingerprint_generated",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        adaptive_hint=adaptive_hint,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "fingerprint": fingerprint,
+        "adaptive_hint": adaptive_hint,
+    }
+
+
+@app.post("/warmup/slo/control-loop")
+def slo_control_loop(payload: SloControlLoopRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    provider = payload.provider.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+        throttled = (
+            payload.send_success_ratio < 0.9
+            or payload.placement_score < 0.7
+            or payload.queue_latency_seconds > 120
+        )
+        if throttled:
+            profile.mode = "throttle"
+            profile.current_daily_target = max(1, int(profile.current_daily_target * 0.8))
+        elif profile.mode == "throttle" and payload.send_success_ratio >= 0.95 and payload.placement_score >= 0.8:
+            profile.mode = "normal"
+            profile.current_daily_target = min(MAX_MAILBOX_DAILY_CAP, profile.current_daily_target + 5)
+        profile.updated_at = utc_now()
+        session.commit()
+        target = profile.current_daily_target
+        mode = profile.mode
+    json_log(
+        "slo_control_loop_applied",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        provider=provider,
+        mode=mode,
+        target=target,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "provider": provider,
+        "mode": mode,
+        "daily_target": target,
     }
 
 

@@ -92,6 +92,7 @@ async def proxy(request: Request, service: str, path: str) -> dict | str:
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     request_id = getattr(request.state, "request_id", request.headers.get("x-request-id", str(uuid.uuid4())))
     headers["x-request-id"] = request_id
+    headers["x-correlation-id"] = request_id
     headers["x-caller-service"] = "gateway"
     headers["x-caller-identity"] = "spiffe://email-warmup/gateway"
     headers["x-target-service"] = service

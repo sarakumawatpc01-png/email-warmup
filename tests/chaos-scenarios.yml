@@ -1,0 +1,24 @@
+scenarios:
+  - name: redis_outage
+    target: warmup-engine
+    action: block_network
+    duration_seconds: 60
+    expected:
+      - queues_fallback_to_in_memory
+      - no_data_loss_for_new_events
+
+  - name: postgres_outage
+    target: warmup-engine
+    action: stop_dependency
+    dependency: postgres
+    duration_seconds: 60
+    expected:
+      - endpoints_fail_fast_with_5xx
+      - service_recovers_after_dependency_returns
+
+  - name: provider_webhook_replay
+    target: billing-service
+    action: replay_webhook
+    expected:
+      - duplicate_rejected_with_409
+      - anomaly_flag_present

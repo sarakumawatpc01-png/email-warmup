@@ -1153,6 +1153,12 @@ app.get('/admin/payments/reconciliation/dlq', adminReadLimiter, (req, res) => {
   return res.json({ items: reconciliationDlq.items });
 });
 
+if (reconciliationWorkerIntervalMs > 0) {
+  setInterval(() => {
+    runReconciliationWorkerPass();
+  }, reconciliationWorkerIntervalMs);
+}
+
 app.get('/admin/payments/providers', adminReadLimiter, (req, res) => {
   Promise.resolve()
     .then(() => loadProviderConfig())

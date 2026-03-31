@@ -22,11 +22,34 @@ receivers:
     webhook_configs:
       - url: "http://oncall-webhook:8080/alerts/default"
         send_resolved: true
+    slack_configs:
+      - send_resolved: true
+        api_url: ${ALERTMANAGER_SLACK_WEBHOOK_URL}
+        channel: "#email-warmup-alerts"
+        title: "[default] {{ .CommonLabels.alertname }}"
+        text: "{{ .CommonAnnotations.summary }}"
   - name: oncall-critical
     webhook_configs:
       - url: "http://oncall-webhook:8080/alerts/critical"
+        send_resolved: true
+    pagerduty_configs:
+      - routing_key: ${ALERTMANAGER_PAGERDUTY_ROUTING_KEY}
+        severity: critical
+        send_resolved: true
+    email_configs:
+      - to: ${ALERTMANAGER_ESCALATION_EMAIL}
+        from: ${ALERTMANAGER_FROM_EMAIL}
+        smarthost: ${ALERTMANAGER_SMARTHOST}
+        auth_username: ${ALERTMANAGER_SMTP_USERNAME}
+        auth_password: ${ALERTMANAGER_SMTP_PASSWORD}
         send_resolved: true
   - name: oncall-warning
     webhook_configs:
       - url: "http://oncall-webhook:8080/alerts/warning"
         send_resolved: true
+    slack_configs:
+      - send_resolved: true
+        api_url: ${ALERTMANAGER_SLACK_WEBHOOK_URL}
+        channel: "#email-warmup-warnings"
+        title: "[warning] {{ .CommonLabels.alertname }}"
+        text: "{{ .CommonAnnotations.summary }}"
