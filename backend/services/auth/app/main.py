@@ -63,7 +63,7 @@ def _resolve_secret(env_name: str, default: str) -> str:
         return default
 
 
-def _allow_rate_limited(scope: str, key: str, limit: int, window_seconds: int) -> bool:
+def _is_rate_limit_allowed(scope: str, key: str, limit: int, window_seconds: int) -> bool:
     now = datetime.now(timezone.utc).timestamp()
     bucket_key = f"{scope}:{key.lower().strip()}"
     with _RATE_LIMIT_LOCK:
@@ -355,7 +355,7 @@ def health() -> dict:
 @app.post("/signup")
 def signup(payload: SignupRequest) -> dict:
     key = payload.email.lower()
-    if not _allow_rate_limited("signup", key, AUTH_SIGNUP_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
+    if not _is_rate_limit_allowed("signup", key, AUTH_SIGNUP_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     if key in users:
         raise HTTPException(status_code=409, detail="User already exists")
@@ -375,7 +375,7 @@ def signup(payload: SignupRequest) -> dict:
 @app.post("/login")
 def login(payload: LoginRequest) -> dict:
     key = payload.email.lower()
-    if not _allow_rate_limited("login", key, AUTH_LOGIN_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
+    if not _is_rate_limit_allowed("login", key, AUTH_LOGIN_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     user = users.get(key)
     if not user:
@@ -391,7 +391,7 @@ def login(payload: LoginRequest) -> dict:
 @app.post("/password-reset/request")
 def password_reset_request(payload: ResetRequest) -> dict:
     key = payload.email.lower()
-    if not _allow_rate_limited("password-reset", key, AUTH_RESET_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
+    if not _is_rate_limit_allowed("password-reset", key, AUTH_RESET_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     if key not in users:
         return {"status": "accepted"}

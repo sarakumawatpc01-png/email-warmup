@@ -106,7 +106,7 @@ const html = `<!doctype html>
             <input id="audit-actor" class="border rounded px-2 py-1" placeholder="actor" />
             <input id="audit-action" class="border rounded px-2 py-1" placeholder="action/event" />
             <input id="audit-resource-type" class="border rounded px-2 py-1" placeholder="resource_type" />
-            <input id="audit-since" class="border rounded px-2 py-1" placeholder="since ISO8601" />
+            <input id="audit-since" class="border rounded px-2 py-1" placeholder="since ISO8601 (e.g. 2026-03-31T00:00:00Z)" />
             <button id="audit-filter" class="bg-indigo-600 text-white rounded px-3 py-1">Filter</button>
           </div>
           <div class="grid md:grid-cols-4 gap-2 mb-2">
@@ -283,7 +283,7 @@ const html = `<!doctype html>
         const action = q('audit-action').value.trim();
         const resourceType = q('audit-resource-type').value.trim();
         const since = q('audit-since').value.trim();
-        if (since && Number.isNaN(Date.parse(since))) {
+        if (since && isNaN(Date.parse(since))) {
           banner('since must be a valid ISO timestamp.', 'error');
           return;
         }
@@ -307,7 +307,7 @@ const html = `<!doctype html>
       });
       q('audit-retention-run').onclick = () => withLoading(q('audit-retention-run'), async () => {
         const days = Math.max(1, Number(q('audit-retention-days').value || '90'));
-        const warmup = await apiFetch('/warmup/admin/audit-logs/retention?dry_run=false', { method: 'POST', body: JSON.stringify({}) });
+        const warmup = await apiFetch('/warmup/admin/audit-logs/retention?dry_run=false', { method: 'POST' });
         const billing = await apiFetch('/billing/admin/audit-logs/retention', { method: 'POST', body: JSON.stringify({ dry_run: false, retention_days: days }) });
         q('audit-filter-output').textContent = JSON.stringify({ warmup: warmup.payload, billing: billing.payload }, null, 2);
         banner('Audit retention completed.');

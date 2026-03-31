@@ -994,6 +994,73 @@ def test_warmup_admin_audit_export_and_filter():
     assert filtered.status_code == 200
     assert "items" in filtered.json()
 
+
+def test_end_to_end_auth_lead_warmup_and_admin_flow():
+    auth_client = TestClient(auth_app)
+    lead_client = TestClient(lead_app)
+    warmup_client = TestClient(warmup_app)
+
+    signup = auth_client.post(
+        "/signup",
+        json={
+            "email": f"tenant-e2e-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "tenant_admin",
+            "tenant_id": "tenant-e2e",
+        },
+    )
+    assert signup.status_code == 200
+    access_token = signup.json()["access_token"]
+
+    lead = lead_client.post(
+        "/leads",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={"email": f"lead-e2e-{uuid.uuid4().hex[:6]}@example.com", "company": "Acme"},
+    )
+    assert lead.status_code == 200
+
+    bulk = lead_client.post(
+        "/leads/bulk",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json=[
+            {"email": "bulk-e2e-duplicate@example.com"},
+            {"email": "bulk-e2e-duplicate@example.com"},
+            {"email": f"bulk-b-{uuid.uuid4().hex[:6]}@example.com"},
+        ],
+    )
+    assert bulk.status_code == 200
+    assert bulk.json()["created"] == 2
+    assert bulk.json()["rejected"] == 1
+
+    job = warmup_client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": "tenant-e2e",
+            "mailbox": "tenant-admin@example.com",
+            "domain_age_days": 30,
+            "blacklist_detected": False,
+        },
+    )
+    assert job.status_code == 200
+    assert job.json()["job_id"].startswith("warmup-")
+
+    service_token = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin", "read"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert service_token.status_code == 200
+    token = service_token.json()["access_token"]
+
+    headers = gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}")
+    audit = warmup_client.get("/warmup/admin/audit-logs?limit=20", headers=headers)
+    assert audit.status_code == 200
+    assert "items" in audit.json()
+
 def test_warmup_phase_h_foundation_endpoints():
     client = TestClient(warmup_app)
     tenant = f"tenant-h-{uuid.uuid4().hex[:6]}"

@@ -1323,10 +1323,17 @@ app.get('/admin/audit-logs/export', adminReadLimiter, (req, res) => {
   }
   const limit = Math.max(1, Math.min(Number(req.query.limit || 200), 1000));
   const items = (auditLogsState.items || []).slice(-limit).reverse();
+  const safeCsv = (value) => {
+    const text = String(value || '');
+    if (['=', '+', '-', '@', '\t'].some((prefix) => text.startsWith(prefix))) {
+      return `'${text}`;
+    }
+    return text;
+  };
   const header = 'at,actor,event,resource_type,resource_id,details';
   const rows = items.map((item) => {
-    const details = JSON.stringify(item.details || {}).replaceAll('"', '""');
-    return `"${item.at}","${item.actor || ''}","${item.event || ''}","${item.resource_type || ''}","${item.resource_id || ''}","${details}"`;
+    const details = safeCsv(JSON.stringify(item.details || {})).replaceAll('"', '""');
+    return `"${safeCsv(item.at)}","${safeCsv(item.actor)}","${safeCsv(item.event)}","${safeCsv(item.resource_type)}","${safeCsv(item.resource_id)}","${details}"`;
   });
   res.setHeader('content-type', 'text/csv');
   res.setHeader('content-disposition', 'attachment; filename=billing-audit-logs.csv');

@@ -75,7 +75,7 @@ def _resolve_secret(env_name: str, default: str) -> str:
         return default
 
 
-def _allow_rate_limited(scope: str, key: str, limit: int, window_seconds: int) -> bool:
+def _is_rate_limit_allowed(scope: str, key: str, limit: int, window_seconds: int) -> bool:
     now = datetime.now(timezone.utc).timestamp()
     bucket_key = f"{scope}:{key.lower().strip()}"
     with _RATE_LIMIT_LOCK:
@@ -254,7 +254,7 @@ def list_leads(
 def bulk_create(items: list[LeadCreate], claims: dict = Depends(parse_token)) -> dict:
     _require_warmup_access(claims)
     tenant_id = claims["tenant_id"]
-    if not _allow_rate_limited("bulk", tenant_id, LEAD_BULK_RATE_LIMIT, LEAD_BULK_RATE_WINDOW_SECONDS):
+    if not _is_rate_limit_allowed("bulk", tenant_id, LEAD_BULK_RATE_LIMIT, LEAD_BULK_RATE_WINDOW_SECONDS):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     normalized_emails = [item.email.lower() for item in items]
     unique_emails = list(dict.fromkeys(normalized_emails))

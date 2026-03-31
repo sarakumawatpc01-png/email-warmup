@@ -812,7 +812,11 @@ def require_admin(
     x_gateway_signature: str | None = None,
 ) -> dict[str, Any]:
     claims: dict[str, Any] = {}
-    rate_identity = (authorization.removeprefix("Bearer ").strip()[:32] if authorization else (api_key or "anon")[:32])
+    rate_identity = (
+        f"auth:{x_caller_service or 'caller'}:{x_request_id or ''}"
+        if authorization
+        else f"key:{api_key or 'anon'}:{x_caller_service or 'caller'}:{x_request_id or ''}"
+    )
     bucket_key = f"admin:{rate_identity}"
     now = time.monotonic()
     with _ADMIN_RATE_LOCK:
@@ -844,6 +848,13 @@ def require_admin(
     if not api_key or api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Admin API key required")
     return claims
+
+
+def _safe_csv_cell(value: Any) -> str:
+    text_value = str(value if value is not None else "")
+    if text_value.startswith(("=", "+", "-", "@", "\t")):
+        return f"'{text_value}"
+    return text_value
 
 
 def write_admin_audit_log(
@@ -2516,7 +2527,16 @@ def export_admin_audit_logs_csv(
     writer = csv.writer(buffer)
     writer.writerow(["created_at", "actor", "action", "resource_type", "resource_id", "details"])
     for row in rows:
-        writer.writerow([row.created_at.isoformat(), row.actor, row.action, row.resource_type, row.resource_id, row.details or "{}"])
+        writer.writerow(
+            [
+                _safe_csv_cell(row.created_at.isoformat()),
+                _safe_csv_cell(row.actor),
+                _safe_csv_cell(row.action),
+                _safe_csv_cell(row.resource_type),
+                _safe_csv_cell(row.resource_id),
+                _safe_csv_cell(row.details or "{}"),
+            ]
+        )
     return Response(
         content=buffer.getvalue(),
         media_type="text/csv",

@@ -115,7 +115,7 @@ def _rate_limit_key(request: Request) -> str:
     return (request.client.host if request.client else "unknown").strip().lower()
 
 
-def _allow_rate_limited(key: str, limit: int, window_seconds: int) -> bool:
+def _is_rate_limit_allowed(key: str, limit: int, window_seconds: int) -> bool:
     now = time.monotonic()
     with _RATE_LIMIT_LOCK:
         bucket = _RATE_LIMIT_BUCKETS[key]
@@ -229,7 +229,7 @@ async def otel_gateway_middleware(request: Request, call_next):
             return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
     if request.url.path.startswith("/policy/"):
         key = f"policy:{_rate_limit_key(request)}"
-        if not _allow_rate_limited(key, GATEWAY_ADMIN_RATE_LIMIT, GATEWAY_ADMIN_RATE_WINDOW_SECONDS):
+        if not _is_rate_limit_allowed(key, GATEWAY_ADMIN_RATE_LIMIT, GATEWAY_ADMIN_RATE_WINDOW_SECONDS):
             return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
     start = time.perf_counter()
     request.state.request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
