@@ -52,6 +52,7 @@ const webhookTimestampToleranceSeconds = Number(process.env.BILLING_WEBHOOK_TIME
 const webhookNonceTtlSeconds = Number(process.env.BILLING_WEBHOOK_NONCE_TTL_SECONDS || 900);
 const reconciliationMaxAttempts = Number(process.env.BILLING_RECONCILIATION_MAX_ATTEMPTS || 5);
 const reconciliationWorkerIntervalMs = Number(process.env.BILLING_RECONCILIATION_WORKER_INTERVAL_MS || 0);
+const reconciliationMaxBackoffMs = Number(process.env.BILLING_RECONCILIATION_MAX_BACKOFF_MS || 60000);
 const externalEffectRetention = Number(process.env.BILLING_EXTERNAL_EFFECT_RETENTION || 2000);
 
 let paymentProviders = {
@@ -323,7 +324,7 @@ let webhookIndex = loadJsonFile(webhookIndexPath, { by_dedupe_key: {}, last_hash
 
 function recordWebhookLedger({ provider, eventId, signature, payloadBuffer }) {
   const dedupeKey = `${provider}:${eventId}`;
-  if (webhookIndex.by_dedupe_key[dedupeKey]) {
+  if (readSafe(webhookIndex.by_dedupe_key, dedupeKey)) {
     return { duplicate: true, dedupeKey };
   }
   const payloadHash = sha256(payloadBuffer);
@@ -344,12 +345,12 @@ function recordWebhookLedger({ provider, eventId, signature, payloadBuffer }) {
   };
   fs.mkdirSync(path.dirname(webhookLedgerPath), { recursive: true });
   fs.appendFileSync(webhookLedgerPath, `${JSON.stringify(entry)}\n`);
-  webhookIndex.by_dedupe_key[dedupeKey] = {
+  writeSafe(webhookIndex.by_dedupe_key, dedupeKey, {
     at,
     provider,
     event_id: eventId,
     entry_hash: entryHash,
-  };
+  });
   webhookIndex.last_hash = entryHash;
   writeJsonFile(webhookIndexPath, webhookIndex);
   return { duplicate: false, dedupeKey, entryHash };
@@ -441,15 +442,35 @@ function normalizeProvider(provider) {
   return value || 'manual';
 }
 
+function isUnsafeObjectKey(value) {
+  const key = String(value || '');
+  return key === '__proto__' || key === 'prototype' || key === 'constructor';
+}
+
+function readSafe(container, key) {
+  if (!container || isUnsafeObjectKey(key)) {
+    return undefined;
+  }
+  return container[key];
+}
+
+function writeSafe(container, key, value) {
+  if (!container || isUnsafeObjectKey(key)) {
+    return false;
+  }
+  container[key] = value;
+  return true;
+}
+
 function purgeExpiredNonces(provider, nowEpoch) {
   const byProvider = webhookNonceIndex.by_provider || {};
-  const nonceMap = byProvider[provider] || {};
+  const nonceMap = readSafe(byProvider, provider) || {};
   for (const [nonce, expiresAt] of Object.entries(nonceMap)) {
     if (Number(expiresAt) <= nowEpoch) {
       delete nonceMap[nonce];
     }
   }
-  byProvider[provider] = nonceMap;
+  writeSafe(byProvider, provider, nonceMap);
   webhookNonceIndex.by_provider = byProvider;
 }
 
@@ -469,12 +490,12 @@ function validateWebhookEnvelope(provider, req) {
   }
   purgeExpiredNonces(provider, nowEpoch);
   const byProvider = webhookNonceIndex.by_provider || {};
-  const nonceMap = byProvider[provider] || {};
-  if (nonceMap[nonce]) {
+  const nonceMap = readSafe(byProvider, provider) || {};
+  if (readSafe(nonceMap, nonce)) {
     return { ok: false, status: 409, reason: 'Webhook nonce replay detected' };
   }
-  nonceMap[nonce] = nowEpoch + webhookNonceTtlSeconds;
-  byProvider[provider] = nonceMap;
+  writeSafe(nonceMap, nonce, nowEpoch + webhookNonceTtlSeconds);
+  writeSafe(byProvider, provider, nonceMap);
   webhookNonceIndex.by_provider = byProvider;
   persistWebhookNonceState();
   return { ok: true };
@@ -482,7 +503,7 @@ function validateWebhookEnvelope(provider, req) {
 
 function recordInboxEvent(source, messageId, payload) {
   const key = `${source}:${messageId}`;
-  const existing = eventInbox.by_key[key];
+  const existing = readSafe(eventInbox.by_key, key);
   if (existing) {
     return { duplicate: true, event: existing };
   }
@@ -492,7 +513,7 @@ function recordInboxEvent(source, messageId, payload) {
     payload,
     recorded_at: nowIso(),
   };
-  eventInbox.by_key[key] = event;
+  writeSafe(eventInbox.by_key, key, event);
   persistInboxState();
   return { duplicate: false, event };
 }
@@ -517,7 +538,7 @@ function recordOutboxEvent(topic, dedupeKey, payload) {
 }
 
 function registerExternalEffect(effectKey, payload) {
-  const existing = externalEffects.by_key[effectKey];
+  const existing = readSafe(externalEffects.by_key, effectKey);
   if (existing) {
     return { duplicate: true, effect: existing };
   }
@@ -526,11 +547,11 @@ function registerExternalEffect(effectKey, payload) {
     payload,
     created_at: nowIso(),
   };
-  externalEffects.by_key[effectKey] = effect;
+  writeSafe(externalEffects.by_key, effectKey, effect);
   externalEffects.order.push(effectKey);
   while (externalEffects.order.length > externalEffectRetention) {
     const key = externalEffects.order.shift();
-    if (key) {
+    if (key && !isUnsafeObjectKey(key)) {
       delete externalEffects.by_key[key];
     }
   }
@@ -580,7 +601,8 @@ function runReconciliationWorkerPass() {
         });
         reconciliationDlq.items = reconciliationDlq.items.slice(-1000);
       } else {
-        const delayMs = (2 ** task.retry_count) * 1000;
+        const boundedExponent = Math.min(Number(task.retry_count || 0), 20);
+        const delayMs = Math.min((2 ** boundedExponent) * 1000, reconciliationMaxBackoffMs);
         task.run_after_epoch_ms = nowMs + delayMs;
         pending.push(task);
       }
@@ -605,7 +627,7 @@ function runReconciliationWorkerPass() {
 }
 
 function upsertSubscriptionFromOrder(order) {
-  const existing = subscriptionsState.by_tenant[order.tenant_id];
+  const existing = readSafe(subscriptionsState.by_tenant, order.tenant_id);
   const subscription = {
     subscription_id: existing?.subscription_id || orderRef('sub'),
     tenant_id: order.tenant_id,
@@ -616,7 +638,7 @@ function upsertSubscriptionFromOrder(order) {
     started_at: existing?.started_at || nowIso(),
     updated_at: nowIso(),
   };
-  subscriptionsState.by_tenant[order.tenant_id] = subscription;
+  writeSafe(subscriptionsState.by_tenant, order.tenant_id, subscription);
   persistSubscriptionsState();
   return subscription;
 }
@@ -845,9 +867,10 @@ app.post('/orders', adminWriteLimiter, (req, res) => {
     return res.status(400).json({ error: 'tenant_id, amount and idempotency_key are required' });
   }
   const idemKey = `order:create:${idempotency_key}`;
-  const existingOrderId = ordersState.by_idempotency[idemKey];
-  if (existingOrderId && ordersState.by_id[existingOrderId]) {
-    return res.json({ idempotent: true, order: ordersState.by_id[existingOrderId] });
+  const existingOrderId = readSafe(ordersState.by_idempotency, idemKey);
+  const existingOrder = existingOrderId ? readSafe(ordersState.by_id, existingOrderId) : undefined;
+  if (existingOrderId && existingOrder) {
+    return res.json({ idempotent: true, order: existingOrder });
   }
   const order = {
     order_id: orderRef('ord'),
@@ -861,8 +884,8 @@ app.post('/orders', adminWriteLimiter, (req, res) => {
     created_at: nowIso(),
     updated_at: nowIso(),
   };
-  ordersState.by_id[order.order_id] = order;
-  ordersState.by_idempotency[idemKey] = order.order_id;
+  writeSafe(ordersState.by_id, order.order_id, order);
+  writeSafe(ordersState.by_idempotency, idemKey, order.order_id);
   persistOrdersState();
   const started = upsertSubscriptionFromOrder(order);
   recordOutboxEvent('billing.order.created', `order:${order.order_id}:created`, order);
@@ -875,7 +898,7 @@ app.get('/orders/:orderId', adminReadLimiter, (req, res) => {
   if (!canReadProviders(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const order = ordersState.by_id[req.params.orderId];
+  const order = readSafe(ordersState.by_id, req.params.orderId);
   if (!order) {
     return res.status(404).json({ error: 'Order not found' });
   }
@@ -902,20 +925,24 @@ app.post('/orders/:orderId/cancel', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const order = ordersState.by_id[req.params.orderId];
+  const order = readSafe(ordersState.by_id, req.params.orderId);
   if (!order) {
     return res.status(404).json({ error: 'Order not found' });
   }
   if (order.status === 'cancelled') {
     return res.json({ idempotent: true, order });
   }
-  order.status = 'cancelled';
-  order.updated_at = nowIso();
+  const updatedOrder = { ...order, status: 'cancelled', updated_at: nowIso() };
+  writeSafe(ordersState.by_id, req.params.orderId, updatedOrder);
   persistOrdersState();
-  recordOutboxEvent('billing.order.cancelled', `order:${order.order_id}:cancelled`, order);
-  queueReconciliationTask('order_cancelled', { order_id: order.order_id, provider: order.provider }, `order:${order.order_id}:cancelled`);
-  auditLog('billing_order_cancelled', { order_id: order.order_id, tenant_id: order.tenant_id, ...buildAuditContext(req) });
-  return res.json({ idempotent: false, order });
+  recordOutboxEvent('billing.order.cancelled', `order:${updatedOrder.order_id}:cancelled`, updatedOrder);
+  queueReconciliationTask(
+    'order_cancelled',
+    { order_id: updatedOrder.order_id, provider: updatedOrder.provider },
+    `order:${updatedOrder.order_id}:cancelled`
+  );
+  auditLog('billing_order_cancelled', { order_id: updatedOrder.order_id, tenant_id: updatedOrder.tenant_id, ...buildAuditContext(req) });
+  return res.json({ idempotent: false, order: updatedOrder });
 });
 
 app.post('/subscriptions/start', adminWriteLimiter, (req, res) => {
@@ -935,7 +962,7 @@ app.post('/subscriptions/start', adminWriteLimiter, (req, res) => {
     started_at: nowIso(),
     updated_at: nowIso(),
   };
-  subscriptionsState.by_tenant[tenant_id] = subscription;
+  writeSafe(subscriptionsState.by_tenant, tenant_id, subscription);
   persistSubscriptionsState();
   recordOutboxEvent('billing.subscription.started', `subscription:${tenant_id}:started`, subscription);
   auditLog('billing_subscription_started', { tenant_id, subscription_id: subscription.subscription_id, ...buildAuditContext(req) });
@@ -946,59 +973,57 @@ app.post('/subscriptions/:tenantId/upgrade', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const subscription = subscriptionsState.by_tenant[req.params.tenantId];
+  const subscription = readSafe(subscriptionsState.by_tenant, req.params.tenantId);
   if (!subscription) {
     return res.status(404).json({ error: 'Subscription not found' });
   }
   const plan = req.body?.plan || 'growth';
-  subscription.plan = plan;
-  subscription.status = 'active';
-  subscription.updated_at = nowIso();
+  const updatedSubscription = { ...subscription, plan, status: 'active', updated_at: nowIso() };
+  writeSafe(subscriptionsState.by_tenant, req.params.tenantId, updatedSubscription);
   persistSubscriptionsState();
-  recordOutboxEvent('billing.subscription.upgraded', `subscription:${subscription.tenant_id}:upgrade:${plan}`, subscription);
-  auditLog('billing_subscription_upgraded', { tenant_id: subscription.tenant_id, plan, ...buildAuditContext(req) });
-  return res.json(subscription);
+  recordOutboxEvent('billing.subscription.upgraded', `subscription:${updatedSubscription.tenant_id}:upgrade:${plan}`, updatedSubscription);
+  auditLog('billing_subscription_upgraded', { tenant_id: updatedSubscription.tenant_id, plan, ...buildAuditContext(req) });
+  return res.json(updatedSubscription);
 });
 
 app.post('/subscriptions/:tenantId/downgrade', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const subscription = subscriptionsState.by_tenant[req.params.tenantId];
+  const subscription = readSafe(subscriptionsState.by_tenant, req.params.tenantId);
   if (!subscription) {
     return res.status(404).json({ error: 'Subscription not found' });
   }
   const plan = req.body?.plan || 'starter';
-  subscription.plan = plan;
-  subscription.status = 'active';
-  subscription.updated_at = nowIso();
+  const updatedSubscription = { ...subscription, plan, status: 'active', updated_at: nowIso() };
+  writeSafe(subscriptionsState.by_tenant, req.params.tenantId, updatedSubscription);
   persistSubscriptionsState();
-  recordOutboxEvent('billing.subscription.downgraded', `subscription:${subscription.tenant_id}:downgrade:${plan}`, subscription);
-  auditLog('billing_subscription_downgraded', { tenant_id: subscription.tenant_id, plan, ...buildAuditContext(req) });
-  return res.json(subscription);
+  recordOutboxEvent('billing.subscription.downgraded', `subscription:${updatedSubscription.tenant_id}:downgrade:${plan}`, updatedSubscription);
+  auditLog('billing_subscription_downgraded', { tenant_id: updatedSubscription.tenant_id, plan, ...buildAuditContext(req) });
+  return res.json(updatedSubscription);
 });
 
 app.post('/subscriptions/:tenantId/cancel', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const subscription = subscriptionsState.by_tenant[req.params.tenantId];
+  const subscription = readSafe(subscriptionsState.by_tenant, req.params.tenantId);
   if (!subscription) {
     return res.status(404).json({ error: 'Subscription not found' });
   }
-  subscription.status = 'cancelled';
-  subscription.updated_at = nowIso();
+  const updatedSubscription = { ...subscription, status: 'cancelled', updated_at: nowIso() };
+  writeSafe(subscriptionsState.by_tenant, req.params.tenantId, updatedSubscription);
   persistSubscriptionsState();
-  recordOutboxEvent('billing.subscription.cancelled', `subscription:${subscription.tenant_id}:cancelled`, subscription);
-  auditLog('billing_subscription_cancelled', { tenant_id: subscription.tenant_id, ...buildAuditContext(req) });
-  return res.json(subscription);
+  recordOutboxEvent('billing.subscription.cancelled', `subscription:${updatedSubscription.tenant_id}:cancelled`, updatedSubscription);
+  auditLog('billing_subscription_cancelled', { tenant_id: updatedSubscription.tenant_id, ...buildAuditContext(req) });
+  return res.json(updatedSubscription);
 });
 
 app.get('/subscriptions/:tenantId/current', adminReadLimiter, (req, res) => {
   if (!canReadProviders(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const subscription = subscriptionsState.by_tenant[req.params.tenantId];
+  const subscription = readSafe(subscriptionsState.by_tenant, req.params.tenantId);
   if (!subscription) {
     return res.status(404).json({ error: 'Subscription not found' });
   }
@@ -1009,7 +1034,7 @@ app.post('/orders/:orderId/refunds', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const order = ordersState.by_id[req.params.orderId];
+  const order = readSafe(ordersState.by_id, req.params.orderId);
   if (!order) {
     return res.status(404).json({ error: 'Order not found' });
   }
@@ -1033,8 +1058,9 @@ app.post('/orders/:orderId/refunds', adminWriteLimiter, (req, res) => {
     effect_key: effectKey,
     created_at: nowIso(),
   };
-  refundsState.by_id[refund.refund_id] = refund;
-  refundsState.by_order[order.order_id] = [...(refundsState.by_order[order.order_id] || []), refund.refund_id];
+  writeSafe(refundsState.by_id, refund.refund_id, refund);
+  const existingByOrder = readSafe(refundsState.by_order, order.order_id) || [];
+  writeSafe(refundsState.by_order, order.order_id, [...existingByOrder, refund.refund_id]);
   persistRefundsState();
   recordOutboxEvent('billing.refund.succeeded', `refund:${refund.refund_id}:succeeded`, refund);
   queueReconciliationTask('refund_created', { refund_id: refund.refund_id, order_id: order.order_id }, `refund:${refund.refund_id}`);
@@ -1046,15 +1072,15 @@ app.get('/orders/:orderId/refunds', adminReadLimiter, (req, res) => {
   if (!canReadProviders(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const ids = refundsState.by_order[req.params.orderId] || [];
-  return res.json({ items: ids.map((id) => refundsState.by_id[id]).filter(Boolean) });
+  const ids = readSafe(refundsState.by_order, req.params.orderId) || [];
+  return res.json({ items: ids.map((id) => readSafe(refundsState.by_id, id)).filter(Boolean) });
 });
 
 app.post('/orders/:orderId/disputes', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const order = ordersState.by_id[req.params.orderId];
+  const order = readSafe(ordersState.by_id, req.params.orderId);
   if (!order) {
     return res.status(404).json({ error: 'Order not found' });
   }
@@ -1070,8 +1096,9 @@ app.post('/orders/:orderId/disputes', adminWriteLimiter, (req, res) => {
     created_at: nowIso(),
     updated_at: nowIso(),
   };
-  disputesState.by_id[dispute.dispute_id] = dispute;
-  disputesState.by_order[order.order_id] = [...(disputesState.by_order[order.order_id] || []), dispute.dispute_id];
+  writeSafe(disputesState.by_id, dispute.dispute_id, dispute);
+  const existingDisputes = readSafe(disputesState.by_order, order.order_id) || [];
+  writeSafe(disputesState.by_order, order.order_id, [...existingDisputes, dispute.dispute_id]);
   persistDisputesState();
   recordOutboxEvent('billing.dispute.opened', `dispute:${dispute.dispute_id}:opened`, dispute);
   queueReconciliationTask('dispute_opened', { dispute_id: dispute.dispute_id, order_id: order.order_id }, `dispute:${dispute.dispute_id}:opened`);
@@ -1083,26 +1110,30 @@ app.post('/disputes/:disputeId/resolve', adminWriteLimiter, (req, res) => {
   if (!verifyAdmin(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const dispute = disputesState.by_id[req.params.disputeId];
+  const dispute = readSafe(disputesState.by_id, req.params.disputeId);
   if (!dispute) {
     return res.status(404).json({ error: 'Dispute not found' });
   }
   const resolution = req.body?.resolution || 'won';
-  dispute.status = resolution === 'lost' ? 'lost' : 'won';
-  dispute.resolution = resolution;
-  dispute.updated_at = nowIso();
+  const resolvedDispute = {
+    ...dispute,
+    status: resolution === 'lost' ? 'lost' : 'won',
+    resolution,
+    updated_at: nowIso(),
+  };
+  writeSafe(disputesState.by_id, req.params.disputeId, resolvedDispute);
   persistDisputesState();
-  recordOutboxEvent('billing.dispute.resolved', `dispute:${dispute.dispute_id}:resolved:${resolution}`, dispute);
-  auditLog('billing_dispute_resolved', { dispute_id: dispute.dispute_id, resolution, ...buildAuditContext(req) });
-  return res.json(dispute);
+  recordOutboxEvent('billing.dispute.resolved', `dispute:${resolvedDispute.dispute_id}:resolved:${resolution}`, resolvedDispute);
+  auditLog('billing_dispute_resolved', { dispute_id: resolvedDispute.dispute_id, resolution, ...buildAuditContext(req) });
+  return res.json(resolvedDispute);
 });
 
 app.get('/orders/:orderId/disputes', adminReadLimiter, (req, res) => {
   if (!canReadProviders(req)) {
     return res.status(403).json({ error: 'Unauthorized' });
   }
-  const ids = disputesState.by_order[req.params.orderId] || [];
-  return res.json({ items: ids.map((id) => disputesState.by_id[id]).filter(Boolean) });
+  const ids = readSafe(disputesState.by_order, req.params.orderId) || [];
+  return res.json({ items: ids.map((id) => readSafe(disputesState.by_id, id)).filter(Boolean) });
 });
 
 app.get('/admin/payments/effects', adminReadLimiter, (req, res) => {
@@ -1111,7 +1142,7 @@ app.get('/admin/payments/effects', adminReadLimiter, (req, res) => {
   }
   const limit = Math.max(1, Math.min(Number(req.query.limit || 50), 200));
   const keys = externalEffects.order.slice(-limit).reverse();
-  return res.json({ items: keys.map((key) => externalEffects.by_key[key]).filter(Boolean) });
+  return res.json({ items: keys.map((key) => readSafe(externalEffects.by_key, key)).filter(Boolean) });
 });
 
 app.get('/admin/events/inbox', adminReadLimiter, (req, res) => {
@@ -1155,7 +1186,11 @@ app.get('/admin/payments/reconciliation/dlq', adminReadLimiter, (req, res) => {
 
 if (reconciliationWorkerIntervalMs > 0) {
   setInterval(() => {
-    runReconciliationWorkerPass();
+    try {
+      runReconciliationWorkerPass();
+    } catch (error) {
+      console.error('reconciliation worker pass failed', error);
+    }
   }, reconciliationWorkerIntervalMs);
 }
 
