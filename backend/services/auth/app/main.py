@@ -5,6 +5,8 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
+from collections import defaultdict, deque
+from threading import Lock
 
 import jwt
 from fastapi import FastAPI, HTTPException
@@ -22,10 +24,56 @@ SERVICE_BOOTSTRAP_TOKEN = os.getenv("SERVICE_BOOTSTRAP_TOKEN", "dev-service-boot
 AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev").lower()
 PASSWORD_HASH_ITERATIONS = int(os.getenv("PASSWORD_HASH_ITERATIONS", "390000"))
+SECRETS_MANAGER_URL = os.getenv("SECRETS_MANAGER_URL", "").rstrip("/")
+SECRETS_MANAGER_TOKEN = os.getenv("SECRETS_MANAGER_TOKEN", "")
+AUTH_LOGIN_RATE_LIMIT = int(os.getenv("AUTH_LOGIN_RATE_LIMIT", "120"))
+AUTH_SIGNUP_RATE_LIMIT = int(os.getenv("AUTH_SIGNUP_RATE_LIMIT", "60"))
+AUTH_RESET_RATE_LIMIT = int(os.getenv("AUTH_RESET_RATE_LIMIT", "40"))
+AUTH_RATE_WINDOW_SECONDS = int(os.getenv("AUTH_RATE_WINDOW_SECONDS", "60"))
+AUTH_SCHEMA_VERSION = "2026-03-31-auth-v1"
+_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+_RATE_LIMIT_LOCK = Lock()
 
 
 def _is_non_production_env() -> bool:
     return DEPLOY_ENV in {"dev", "test", "local"}
+
+
+def _resolve_secret(env_name: str, default: str) -> str:
+    value = os.getenv(env_name)
+    if value and not value.startswith("sm://"):
+        return value
+    secret_name = value.removeprefix("sm://") if value else env_name
+    if not SECRETS_MANAGER_URL:
+        return default
+    try:
+        import httpx
+
+        headers = {}
+        if SECRETS_MANAGER_TOKEN:
+            headers["authorization"] = f"Bearer {SECRETS_MANAGER_TOKEN}"
+        with httpx.Client(timeout=3) as client:
+            response = client.get(f"{SECRETS_MANAGER_URL}/v1/secrets/{secret_name}", headers=headers)
+        if response.status_code != 200:
+            return default
+        payload = response.json()
+        secret_value = payload.get("value")
+        return secret_value if isinstance(secret_value, str) and secret_value else default
+    except Exception:
+        return default
+
+
+def _allow_rate_limited(scope: str, key: str, limit: int, window_seconds: int) -> bool:
+    now = datetime.now(timezone.utc).timestamp()
+    bucket_key = f"{scope}:{key.lower().strip()}"
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS[bucket_key]
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            return False
+        bucket.append(now)
+        return True
 
 
 def _enforce_runtime_secrets() -> None:
@@ -80,6 +128,23 @@ def _init_state_store() -> None:
                 updated_at TEXT NOT NULL
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_versions (
+                service TEXT NOT NULL,
+                version TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                PRIMARY KEY(service, version)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_versions (service, version, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            ("auth-service", AUTH_SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
         )
         revoked_token_ids.update(row[0] for row in conn.execute("SELECT jti FROM revoked_tokens"))
         revoked_session_ids.update(row[0] for row in conn.execute("SELECT sid FROM revoked_sessions"))
@@ -290,6 +355,8 @@ def health() -> dict:
 @app.post("/signup")
 def signup(payload: SignupRequest) -> dict:
     key = payload.email.lower()
+    if not _allow_rate_limited("signup", key, AUTH_SIGNUP_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     if key in users:
         raise HTTPException(status_code=409, detail="User already exists")
 
@@ -308,6 +375,8 @@ def signup(payload: SignupRequest) -> dict:
 @app.post("/login")
 def login(payload: LoginRequest) -> dict:
     key = payload.email.lower()
+    if not _allow_rate_limited("login", key, AUTH_LOGIN_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     user = users.get(key)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -322,6 +391,8 @@ def login(payload: LoginRequest) -> dict:
 @app.post("/password-reset/request")
 def password_reset_request(payload: ResetRequest) -> dict:
     key = payload.email.lower()
+    if not _allow_rate_limited("password-reset", key, AUTH_RESET_RATE_LIMIT, AUTH_RATE_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     if key not in users:
         return {"status": "accepted"}
 
@@ -458,5 +529,7 @@ def issue_service_token(payload: ServiceTokenRequest) -> dict:
     }
 
 
+JWT_SECRET = _resolve_secret("JWT_SECRET", JWT_SECRET)
+SERVICE_BOOTSTRAP_TOKEN = _resolve_secret("SERVICE_BOOTSTRAP_TOKEN", SERVICE_BOOTSTRAP_TOKEN)
 _enforce_runtime_secrets()
 _init_state_store()

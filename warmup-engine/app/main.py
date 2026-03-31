@@ -9,10 +9,13 @@ import time
 import uuid
 import hmac
 import hashlib
+import csv
+import io
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from threading import Lock
 
 import httpx
 import jwt
@@ -79,6 +82,42 @@ GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signin
 GATEWAY_SIGNATURE_MAX_AGE_SECONDS = int(os.getenv("GATEWAY_SIGNATURE_MAX_AGE_SECONDS", "300"))
 AUTHZ_CACHE_TTL_SECONDS = int(os.getenv("AUTHZ_CACHE_TTL_SECONDS", "5"))
 AUTHZ_CACHE_MAX_ENTRIES = int(os.getenv("AUTHZ_CACHE_MAX_ENTRIES", "2048"))
+SECRETS_MANAGER_URL = os.getenv("SECRETS_MANAGER_URL", "").rstrip("/")
+SECRETS_MANAGER_TOKEN = os.getenv("SECRETS_MANAGER_TOKEN", "")
+ADMIN_RATE_LIMIT_PER_MINUTE = int(os.getenv("WARMUP_ADMIN_RATE_LIMIT_PER_MINUTE", "30"))
+AUDIT_LOG_RETENTION_DAYS = int(os.getenv("AUDIT_LOG_RETENTION_DAYS", "90"))
+WARMUP_SCHEMA_VERSION = "2026-03-31-warmup-v1"
+_ADMIN_RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+_ADMIN_RATE_LOCK = Lock()
+
+
+def _resolve_secret(env_name: str, default: str) -> str:
+    value = os.getenv(env_name)
+    if value and not value.startswith("sm://"):
+        return value
+    secret_name = value.removeprefix("sm://") if value else env_name
+    if not SECRETS_MANAGER_URL:
+        return default
+    try:
+        headers = {}
+        if SECRETS_MANAGER_TOKEN:
+            headers["authorization"] = f"Bearer {SECRETS_MANAGER_TOKEN}"
+        with httpx.Client(timeout=3) as client:
+            response = client.get(f"{SECRETS_MANAGER_URL}/v1/secrets/{secret_name}", headers=headers)
+        if response.status_code != 200:
+            return default
+        payload = response.json()
+        secret_value = payload.get("value")
+        return secret_value if isinstance(secret_value, str) and secret_value else default
+    except Exception:
+        return default
+
+
+DATABASE_URL = _resolve_secret("WARMUP_DATABASE_URL", DATABASE_URL)
+REDIS_URL = _resolve_secret("REDIS_URL", REDIS_URL)
+AUTH_JWT_SECRET = _resolve_secret("JWT_SECRET", AUTH_JWT_SECRET)
+GATEWAY_SIGNING_SECRET = _resolve_secret("GATEWAY_SIGNING_SECRET", GATEWAY_SIGNING_SECRET)
+
 
 def init_engine():
     try:
@@ -425,6 +464,14 @@ class ApprovalRequest(Base):
 
 
 Base.metadata.create_all(engine)
+with engine.begin() as conn:
+    conn.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS schema_versions (service TEXT NOT NULL, version TEXT NOT NULL, applied_at TEXT NOT NULL, PRIMARY KEY(service, version))"
+    )
+    conn.exec_driver_sql(
+        "INSERT OR IGNORE INTO schema_versions (service, version, applied_at) VALUES (?, ?, ?)",
+        ("warmup-engine", WARMUP_SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
+    )
 
 if trace and TracerProvider and BatchSpanProcessor:
     resource = Resource.create({"service.name": "warmup-engine"}) if Resource else None
@@ -765,6 +812,16 @@ def require_admin(
     x_gateway_signature: str | None = None,
 ) -> dict[str, Any]:
     claims: dict[str, Any] = {}
+    rate_identity = (authorization.removeprefix("Bearer ").strip()[:32] if authorization else (api_key or "anon")[:32])
+    bucket_key = f"admin:{rate_identity}"
+    now = time.monotonic()
+    with _ADMIN_RATE_LOCK:
+        bucket = _ADMIN_RATE_BUCKETS[bucket_key]
+        while bucket and now - bucket[0] > 60:
+            bucket.popleft()
+        if len(bucket) >= ADMIN_RATE_LIMIT_PER_MINUTE:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        bucket.append(now)
     if authorization:
         claims = extract_token_claims(authorization)
         _validate_gateway_service_headers(
@@ -2353,6 +2410,10 @@ def mailbox_health(
 @app.get("/warmup/admin/audit-logs")
 def list_admin_audit_logs(
     limit: int = 100,
+    actor: str | None = None,
+    action: str | None = None,
+    resource_type: str | None = None,
+    since: str | None = None,
     x_admin_api_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
@@ -2377,7 +2438,20 @@ def list_admin_audit_logs(
         raise HTTPException(status_code=403, detail="Superadmin required")
     capped_limit = max(1, min(limit, 300))
     with Session(engine) as session:
-        rows = session.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc()).limit(capped_limit)).all()
+        stmt = select(AdminAuditLog)
+        if actor:
+            stmt = stmt.where(AdminAuditLog.actor == actor)
+        if action:
+            stmt = stmt.where(AdminAuditLog.action == action)
+        if resource_type:
+            stmt = stmt.where(AdminAuditLog.resource_type == resource_type)
+        if since:
+            try:
+                since_ts = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                stmt = stmt.where(AdminAuditLog.created_at >= since_ts)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid since timestamp") from exc
+        rows = session.scalars(stmt.order_by(AdminAuditLog.created_at.desc()).limit(capped_limit)).all()
         return {
             "items": [
                 {
@@ -2391,3 +2465,95 @@ def list_admin_audit_logs(
                 for row in rows
             ]
         }
+
+
+@app.get("/warmup/admin/audit-logs/export")
+def export_admin_audit_logs_csv(
+    limit: int = 100,
+    actor: str | None = None,
+    action: str | None = None,
+    resource_type: str | None = None,
+    since: str | None = None,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> Response:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
+    if claims and claims.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin required")
+    capped_limit = max(1, min(limit, 500))
+    with Session(engine) as session:
+        stmt = select(AdminAuditLog)
+        if actor:
+            stmt = stmt.where(AdminAuditLog.actor == actor)
+        if action:
+            stmt = stmt.where(AdminAuditLog.action == action)
+        if resource_type:
+            stmt = stmt.where(AdminAuditLog.resource_type == resource_type)
+        if since:
+            try:
+                since_ts = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                stmt = stmt.where(AdminAuditLog.created_at >= since_ts)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid since timestamp") from exc
+        rows = session.scalars(stmt.order_by(AdminAuditLog.created_at.desc()).limit(capped_limit)).all()
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["created_at", "actor", "action", "resource_type", "resource_id", "details"])
+    for row in rows:
+        writer.writerow([row.created_at.isoformat(), row.actor, row.action, row.resource_type, row.resource_id, row.details or "{}"])
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"content-disposition": "attachment; filename=warmup-admin-audit-logs.csv"},
+    )
+
+
+@app.post("/warmup/admin/audit-logs/retention")
+def enforce_admin_audit_retention(
+    dry_run: bool = False,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
+    if claims and claims.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin required")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, AUDIT_LOG_RETENTION_DAYS))
+    with Session(engine) as session:
+        ids = list(session.scalars(select(AdminAuditLog.id).where(AdminAuditLog.created_at < cutoff)))
+        deleted = len(ids)
+        if not dry_run and deleted:
+            session.execute(delete(AdminAuditLog).where(AdminAuditLog.id.in_(ids)))
+            session.commit()
+    return {"deleted": deleted, "dry_run": dry_run, "retention_days": AUDIT_LOG_RETENTION_DAYS}

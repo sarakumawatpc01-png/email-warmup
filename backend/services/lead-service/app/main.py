@@ -2,6 +2,9 @@ import os
 import sqlite3
 from typing import Optional
 import logging
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from threading import Lock
 
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -13,8 +16,14 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///./lead.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 JWT_ALGORITHM = "HS256"
 AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
+SECRETS_MANAGER_URL = os.getenv("SECRETS_MANAGER_URL", "").rstrip("/")
+SECRETS_MANAGER_TOKEN = os.getenv("SECRETS_MANAGER_TOKEN", "")
+LEAD_BULK_RATE_LIMIT = int(os.getenv("LEAD_BULK_RATE_LIMIT", "20"))
+LEAD_BULK_RATE_WINDOW_SECONDS = int(os.getenv("LEAD_BULK_RATE_WINDOW_SECONDS", "60"))
+LEAD_SCHEMA_VERSION = "2026-03-31-lead-v1"
+_RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
+_RATE_LIMIT_LOCK = Lock()
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 app = FastAPI(title="Lead Service", version="1.0.0")
 logger = logging.getLogger("lead-service")
 
@@ -41,7 +50,56 @@ class Lead(Base):
     )
 
 
+def _resolve_secret(env_name: str, default: str) -> str:
+    value = os.getenv(env_name)
+    if value and not value.startswith("sm://"):
+        return value
+    secret_name = value.removeprefix("sm://") if value else env_name
+    if not SECRETS_MANAGER_URL:
+        return default
+    try:
+        import httpx
+
+        headers = {}
+        if SECRETS_MANAGER_TOKEN:
+            headers["authorization"] = f"Bearer {SECRETS_MANAGER_TOKEN}"
+        with httpx.Client(timeout=3) as client:
+            response = client.get(f"{SECRETS_MANAGER_URL}/v1/secrets/{secret_name}", headers=headers)
+        if response.status_code != 200:
+            return default
+        payload = response.json()
+        secret_value = payload.get("value")
+        return secret_value if isinstance(secret_value, str) and secret_value else default
+    except Exception:
+        logger.warning("secret resolution failed for %s", env_name)
+        return default
+
+
+def _allow_rate_limited(scope: str, key: str, limit: int, window_seconds: int) -> bool:
+    now = datetime.now(timezone.utc).timestamp()
+    bucket_key = f"{scope}:{key.lower().strip()}"
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_LIMIT_BUCKETS[bucket_key]
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            return False
+        bucket.append(now)
+        return True
+
+
+DATABASE_URL = _resolve_secret("DATABASE_URL", DATABASE_URL)
+JWT_SECRET = _resolve_secret("JWT_SECRET", JWT_SECRET)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 Base.metadata.create_all(engine)
+with engine.begin() as conn:
+    conn.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS schema_versions (service TEXT NOT NULL, version TEXT NOT NULL, applied_at TEXT NOT NULL, PRIMARY KEY(service, version))"
+    )
+    conn.exec_driver_sql(
+        "INSERT OR IGNORE INTO schema_versions (service, version, applied_at) VALUES (?, ?, ?)",
+        ("lead-service", LEAD_SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
+    )
 
 
 class LeadCreate(BaseModel):
@@ -196,6 +254,8 @@ def list_leads(
 def bulk_create(items: list[LeadCreate], claims: dict = Depends(parse_token)) -> dict:
     _require_warmup_access(claims)
     tenant_id = claims["tenant_id"]
+    if not _allow_rate_limited("bulk", tenant_id, LEAD_BULK_RATE_LIMIT, LEAD_BULK_RATE_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
     normalized_emails = [item.email.lower() for item in items]
     unique_emails = list(dict.fromkeys(normalized_emails))
     created = 0

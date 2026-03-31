@@ -30,6 +30,33 @@
           "expr": "warmup_slo_send_success_ratio{service=\"warmup-engine\",provider=\"all\"}"
         }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Admin API Error Rate",
+      "targets": [
+        {
+          "expr": "sum(rate(warmup_http_requests_total{service=\"warmup-engine\",path=~\"/warmup/admin/.*\",status_code=~\"4..|5..\"}[5m]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Admin API Latency (p95)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(warmup_http_request_duration_seconds_bucket{service=\"warmup-engine\",path=~\"/warmup/admin/.*\"}[5m])) by (le))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Billing Reconciliation Queue Depth",
+      "targets": [
+        {
+          "expr": "sum(warmup_queue_backlog{service=\"warmup-engine\",queue_name=\"send_execution\"})"
+        }
+      ]
     }
   ]
 }

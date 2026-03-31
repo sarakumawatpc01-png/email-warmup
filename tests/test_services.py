@@ -910,6 +910,90 @@ def test_gateway_rejects_oversized_proxy_body():
     assert response.json()["detail"] == "Request body too large"
 
 
+def test_gateway_policy_rate_limit_applies():
+    gateway_client = TestClient(gateway_app)
+    route = next(route for route in gateway_app.router.routes if getattr(route, "path", "") == "/policy/consensus")
+    gateway_state = route.endpoint.__globals__
+    gateway_state["GATEWAY_ADMIN_RATE_LIMIT"] = 2
+    gateway_state["GATEWAY_ADMIN_RATE_WINDOW_SECONDS"] = 60
+    gateway_state["_RATE_LIMIT_BUCKETS"].clear()
+
+    assert gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"}).status_code == 200
+    assert gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"}).status_code == 200
+    limited = gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"})
+    assert limited.status_code == 429
+
+
+def test_auth_rate_limit_signup_applies():
+    client = TestClient(auth_app)
+    route = next(route for route in auth_app.router.routes if getattr(route, "path", "") == "/signup")
+    state = route.endpoint.__globals__
+    state["AUTH_SIGNUP_RATE_LIMIT"] = 1
+    state["AUTH_RATE_WINDOW_SECONDS"] = 60
+    state["_RATE_LIMIT_BUCKETS"].clear()
+
+    payload = {
+        "email": "rate-limit-signup@example.com",
+        "password": "StrongPass123",
+        "role": "client",
+        "tenant_id": "tenant-rate",
+    }
+    first = client.post("/signup", json=payload)
+    assert first.status_code == 200
+    second = client.post("/signup", json=payload)
+    assert second.status_code == 429
+
+
+def test_lead_bulk_rate_limit_applies():
+    auth_client = TestClient(auth_app)
+    lead_client = TestClient(lead_app)
+    route = next(route for route in lead_app.router.routes if getattr(route, "path", "") == "/leads/bulk")
+    state = route.endpoint.__globals__
+    state["LEAD_BULK_RATE_LIMIT"] = 1
+    state["LEAD_BULK_RATE_WINDOW_SECONDS"] = 60
+    state["_RATE_LIMIT_BUCKETS"].clear()
+
+    signup = auth_client.post(
+        "/signup",
+        json={
+            "email": f"bulk-rate-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "tenant_admin",
+            "tenant_id": "tenant-bulk-rate",
+        },
+    )
+    token = signup.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    body = [{"email": f"{uuid.uuid4().hex[:6]}@example.com"}]
+    assert lead_client.post("/leads/bulk", headers=headers, json=body).status_code == 200
+    limited = lead_client.post("/leads/bulk", headers=headers, json=body)
+    assert limited.status_code == 429
+
+
+def test_warmup_admin_audit_export_and_filter():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    token = issued.json()["access_token"]
+    headers = gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}")
+
+    export = warmup_client.get("/warmup/admin/audit-logs/export?limit=10", headers=headers)
+    assert export.status_code == 200
+    assert "text/csv" in export.headers.get("content-type", "")
+    assert "created_at,actor,action,resource_type,resource_id,details" in export.text
+
+    filtered = warmup_client.get("/warmup/admin/audit-logs?limit=5&action=internal_mailbox_upsert", headers=headers)
+    assert filtered.status_code == 200
+    assert "items" in filtered.json()
+
 def test_warmup_phase_h_foundation_endpoints():
     client = TestClient(warmup_app)
     tenant = f"tenant-h-{uuid.uuid4().hex[:6]}"
