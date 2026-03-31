@@ -20,6 +20,6 @@ fi
 
 docker run -d --name "${name}" --network app-net -p 0:80 \
   -e MAUTIC_TENANT="${tenant}" php:8.2-apache \
-  sh -c "printf '%s\n' \"<?php echo 'Mautic instance for ' . getenv('MAUTIC_TENANT'); ?>\" > /var/www/html/index.php && apache2-foreground"
+  sh -c "printf '%s\n' \"<?php \\$tenant=getenv('MAUTIC_TENANT'); if(!preg_match('/^[a-z0-9-]{2,64}$/', \\$tenant)){http_response_code(400); echo 'Invalid tenant'; exit;} echo 'Mautic instance for ' . htmlspecialchars(\\$tenant, ENT_QUOTES, 'UTF-8'); ?>\" > /var/www/html/index.php && apache2-foreground"
 
 echo "Provisioned ${name}"

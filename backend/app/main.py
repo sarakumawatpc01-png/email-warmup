@@ -143,7 +143,13 @@ async def proxy(request: Request, service: str, path: str) -> Response:
         )
 
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail="Upstream service request failed")
+        detail = (getattr(response, "text", "") or "").strip()
+        if len(detail) > 500:
+            detail = f"{detail[:500]}..."
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=detail or "Upstream service request failed",
+        )
     forwarded_headers = {}
     for key in ("content-type", "location", "cache-control", "etag"):
         value = response.headers.get(key)

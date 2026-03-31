@@ -181,21 +181,16 @@ def hash_password(password: str, salt: str) -> str:
 def verify_password(password: str, user: dict) -> bool:
     salt = user["salt"]
     stored_hash = user.get("password_hash", "")
-    if isinstance(stored_hash, str) and stored_hash.startswith("pbkdf2_sha256$"):
-        _, iterations, expected = stored_hash.split("$", 2)
-        derived = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt.encode("utf-8"),
-            int(iterations),
-        ).hex()
-        return hmac.compare_digest(derived, expected)
-
-    legacy = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-    if hmac.compare_digest(legacy, str(stored_hash)):
-        user["password_hash"] = hash_password(password, salt)
-        return True
-    return False
+    if not isinstance(stored_hash, str) or not stored_hash.startswith("pbkdf2_sha256$"):
+        return False
+    _, iterations, expected = stored_hash.split("$", 2)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        int(iterations),
+    ).hex()
+    return hmac.compare_digest(derived, expected)
 
 
 def _new_jti() -> str:
