@@ -1,5 +1,7 @@
 import os
+import sqlite3
 from typing import Optional
+import logging
 
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -10,9 +12,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///./lead.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 JWT_ALGORITHM = "HS256"
+AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 app = FastAPI(title="Lead Service", version="1.0.0")
+logger = logging.getLogger("lead-service")
 
 
 class Base(DeclarativeBase):
@@ -68,9 +72,44 @@ def parse_token(authorization: str = Header(default="")) -> dict:
         claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
+    if _is_revoked(claims):
+        raise HTTPException(status_code=401, detail="Token revoked")
     if not claims.get("tenant_id"):
         raise HTTPException(status_code=401, detail="Tenant missing")
     return claims
+
+
+def _is_revoked(claims: dict) -> bool:
+    sid = claims.get("sid")
+    jti = claims.get("jti")
+    if not isinstance(sid, str) or not isinstance(jti, str):
+        return False
+    try:
+        with sqlite3.connect(AUTH_STATE_DB_PATH) as conn:
+            if isinstance(sid, str):
+                row = conn.execute("SELECT 1 FROM revoked_sessions WHERE sid = ? LIMIT 1", (sid,)).fetchone()
+                if row:
+                    return True
+            if isinstance(jti, str):
+                row = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ? LIMIT 1", (jti,)).fetchone()
+                if row:
+                    return True
+    except sqlite3.Error:
+        logger.warning("auth_state_db_unavailable", exc_info=True)
+        return True
+    return False
+
+
+def _has_any_permission(claims: dict, *needed: str) -> bool:
+    permissions = claims.get("permissions") or []
+    if not isinstance(permissions, list):
+        return False
+    return "*" in permissions or any(item in permissions for item in needed)
+
+
+def _require_warmup_access(claims: dict) -> None:
+    if not _has_any_permission(claims, "warmup:read", "warmup:admin"):
+        raise HTTPException(status_code=403, detail="Permission denied")
 
 
 @app.get("/health")
@@ -80,6 +119,7 @@ def health() -> dict:
 
 @app.post("/leads", response_model=LeadOut)
 def create_lead(payload: LeadCreate, claims: dict = Depends(parse_token)) -> LeadOut:
+    _require_warmup_access(claims)
     tenant_id = claims["tenant_id"]
     with Session(engine) as session:
         existing = session.scalar(
@@ -111,6 +151,7 @@ def list_leads(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=200),
 ) -> dict:
+    _require_warmup_access(claims)
     tenant_id = claims["tenant_id"]
     with Session(engine) as session:
         stmt = select(Lead).where(Lead.tenant_id == tenant_id)
@@ -153,6 +194,7 @@ def list_leads(
 
 @app.post("/leads/bulk")
 def bulk_create(items: list[LeadCreate], claims: dict = Depends(parse_token)) -> dict:
+    _require_warmup_access(claims)
     tenant_id = claims["tenant_id"]
     normalized_emails = [item.email.lower() for item in items]
     unique_emails = list(dict.fromkeys(normalized_emails))

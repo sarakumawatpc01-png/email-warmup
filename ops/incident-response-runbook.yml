@@ -1,0 +1,26 @@
+incident_response:
+  service: email-warmup
+  severity_levels:
+    - sev1
+    - sev2
+    - sev3
+  playbooks:
+    - trigger: WarmupSendSuccessRatioLow
+      owner: deliverability-oncall
+      actions:
+        - acknowledge alert in PagerDuty/Slack bridge
+        - verify recent provider reputation feed and blacklist ingestion
+        - run /warmup/slo/control-loop for impacted provider
+        - apply kill switch only if customer impact escalates
+    - trigger: WarmupQueueBacklogHigh
+      owner: platform-oncall
+      actions:
+        - inspect queue backlog and inflight leases
+        - run warmup worker sweep and DLQ replay controls
+        - scale worker capacity or reduce target throttle
+    - trigger: Billing reconciliation anomalies
+      owner: billing-oncall
+      actions:
+        - run reconciliation worker pass endpoint
+        - inspect reconciliation DLQ and replay safe entries
+        - review outbox/inbox dedupe anomalies

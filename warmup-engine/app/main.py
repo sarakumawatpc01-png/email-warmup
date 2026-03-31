@@ -7,6 +7,8 @@ import os
 import random
 import time
 import uuid
+import hmac
+import hashlib
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -72,6 +74,11 @@ AUTH_POLICY_URL = os.getenv("AUTH_POLICY_URL", "").rstrip("/")
 POLICY_ENGINE_URL = os.getenv("POLICY_ENGINE_URL", "").rstrip("/")
 POLICY_ENGINE_ADAPTER = os.getenv("POLICY_ENGINE_ADAPTER", "local")
 SERVICE_SPIFFE_ID = os.getenv("WARMUP_SERVICE_SPIFFE_ID", "spiffe://email-warmup/warmup-engine")
+GATEWAY_IDENTITY = os.getenv("GATEWAY_SPIFFE_ID", "spiffe://email-warmup/gateway")
+GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signing-secret")
+GATEWAY_SIGNATURE_MAX_AGE_SECONDS = int(os.getenv("GATEWAY_SIGNATURE_MAX_AGE_SECONDS", "300"))
+AUTHZ_CACHE_TTL_SECONDS = int(os.getenv("AUTHZ_CACHE_TTL_SECONDS", "5"))
+AUTHZ_CACHE_MAX_ENTRIES = int(os.getenv("AUTHZ_CACHE_MAX_ENTRIES", "2048"))
 
 def init_engine():
     try:
@@ -79,7 +86,11 @@ def init_engine():
         with candidate.connect() as conn:
             conn.execute(text("SELECT 1"))
         return candidate
-    except Exception:
+    except Exception as exc:
+        if DEPLOY_ENV not in {"dev", "test", "local"}:
+            raise RuntimeError("Warmup database initialization failed") from exc
+        logger = logging.getLogger("warmup-engine")
+        logger.warning("Falling back to SQLite due to database initialization failure: %s", exc)
         return create_engine(SQLITE_FALLBACK_URL, pool_pre_ping=True)
 
 
@@ -484,6 +495,39 @@ class ContentPlanRequest(BaseModel):
     day_number: int = Field(ge=1, le=365)
 
 
+class SeedMailboxIngestRequest(BaseModel):
+    provider: str = Field(min_length=2, max_length=120)
+    folder: str = Field(min_length=2, max_length=120)
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    message_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
+class ReputationFeedIngestRequest(BaseModel):
+    provider: str = Field(min_length=2, max_length=120)
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    listed: bool = False
+    source: str = Field(default="internal", min_length=2, max_length=120)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class ContentFingerprintRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    subject: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=5000)
+
+
+class SloControlLoopRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    provider: str = Field(min_length=2, max_length=120)
+    send_success_ratio: float = Field(ge=0.0, le=1.0)
+    placement_score: float = Field(ge=0.0, le=1.0)
+    queue_latency_seconds: float = Field(ge=0.0)
+
+
 class KillSwitchRequest(BaseModel):
     scope: Literal["global", "tenant", "provider"]
     enabled: bool
@@ -571,6 +615,91 @@ def extract_token_claims(authorization: str | None) -> dict[str, Any]:
     return claims if isinstance(claims, dict) else {}
 
 
+def _is_service_identity(claims: dict[str, Any]) -> bool:
+    token_type = claims.get("token_type")
+    sub = claims.get("sub")
+    sid = claims.get("sid")
+    return (
+        token_type == "service"
+        and isinstance(sub, str)
+        and sub.startswith("service:")
+        and isinstance(sid, str)
+        and sid.startswith("svc-")
+    )
+
+
+def _validate_gateway_service_headers(
+    x_caller_service: str | None,
+    x_caller_identity: str | None,
+    x_target_service: str | None,
+    x_request_id: str | None,
+    x_gateway_signed_at: str | None,
+    x_gateway_signature: str | None,
+    claims: dict[str, Any],
+) -> None:
+    if not _is_service_identity(claims):
+        return
+    if x_caller_service != "gateway" or x_caller_identity != GATEWAY_IDENTITY:
+        raise HTTPException(status_code=403, detail="Gateway service context required")
+    if x_target_service != "warmup":
+        raise HTTPException(status_code=403, detail="Gateway target context required")
+    if not x_request_id or not x_gateway_signed_at or not x_gateway_signature:
+        raise HTTPException(status_code=403, detail="Gateway signature required")
+    try:
+        signed_at = int(x_gateway_signed_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Invalid gateway signature timestamp") from exc
+    now = int(time.time())
+    if abs(now - signed_at) > GATEWAY_SIGNATURE_MAX_AGE_SECONDS:
+        raise HTTPException(status_code=403, detail="Gateway signature expired")
+    canonical = "|".join([x_caller_service, x_caller_identity, x_target_service, x_request_id, x_gateway_signed_at])
+    expected = hmac.new(
+        GATEWAY_SIGNING_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, x_gateway_signature):
+        raise HTTPException(status_code=403, detail="Gateway signature invalid")
+
+
+class _AuthzCache:
+    def __init__(self, ttl_seconds: int, max_entries: int) -> None:
+        self.ttl_seconds = max(1, ttl_seconds)
+        self.max_entries = max(64, max_entries)
+        self._store: dict[str, tuple[float, bool]] = {}
+
+    def _key(self, token: str, action: str, resource: str, tenant_scope: str | None) -> str:
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return "|".join([token_hash, action, resource, tenant_scope or ""])
+
+    def _purge_expired(self) -> None:
+        now = time.time()
+        expired = [key for key, item in self._store.items() if item[0] < now]
+        for key in expired:
+            self._store.pop(key, None)
+
+    def get(self, token: str, action: str, resource: str, tenant_scope: str | None) -> bool | None:
+        key = self._key(token, action, resource, tenant_scope)
+        item = self._store.get(key)
+        if not item:
+            return None
+        expires_at, value = item
+        if expires_at < time.time():
+            self._store.pop(key, None)
+            return None
+        return value
+
+    def set(self, token: str, action: str, resource: str, tenant_scope: str | None, value: bool) -> None:
+        self._purge_expired()
+        if len(self._store) >= self.max_entries:
+            self._store.pop(next(iter(self._store)), None)
+        key = self._key(token, action, resource, tenant_scope)
+        self._store[key] = (time.time() + self.ttl_seconds, value)
+
+
+AUTHZ_CACHE = _AuthzCache(AUTHZ_CACHE_TTL_SECONDS, AUTHZ_CACHE_MAX_ENTRIES)
+
+
 def policy_check(
     authorization: str | None,
     *,
@@ -580,11 +709,18 @@ def policy_check(
 ) -> bool:
     if not authorization:
         return False
+    token = authorization.removeprefix("Bearer ").strip()
+    cached = AUTHZ_CACHE.get(token, action, resource, tenant_scope)
+    if cached is not None:
+        return cached
     claims = extract_token_claims(authorization)
+    if _is_service_identity(claims):
+        decision = _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+        AUTHZ_CACHE.set(token, action, resource, tenant_scope, decision)
+        return decision
     if claims.get("sid") or claims.get("jti"):
         if AUTH_POLICY_URL:
             try:
-                token = authorization.removeprefix("Bearer ").strip()
                 response = httpx.post(
                     f"{AUTH_POLICY_URL}/authorize",
                     json={
@@ -597,11 +733,15 @@ def policy_check(
                 )
                 if response.status_code == 200:
                     data = response.json()
-                    return bool(data.get("allowed"))
+                    decision = bool(data.get("allowed"))
+                    AUTHZ_CACHE.set(token, action, resource, tenant_scope, decision)
+                    return decision
                 return False
             except Exception:
                 return False
-    return _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+    decision = _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+    AUTHZ_CACHE.set(token, action, resource, tenant_scope, decision)
+    return decision
 
 
 def _has_permission(claims: dict[str, Any], permission: str) -> bool:
@@ -617,10 +757,25 @@ def require_admin(
     *,
     permission: str = "warmup:admin",
     tenant_scope: str | None = None,
+    x_caller_service: str | None = None,
+    x_caller_identity: str | None = None,
+    x_target_service: str | None = None,
+    x_request_id: str | None = None,
+    x_gateway_signed_at: str | None = None,
+    x_gateway_signature: str | None = None,
 ) -> dict[str, Any]:
     claims: dict[str, Any] = {}
     if authorization:
         claims = extract_token_claims(authorization)
+        _validate_gateway_service_headers(
+            x_caller_service,
+            x_caller_identity,
+            x_target_service,
+            x_request_id,
+            x_gateway_signed_at,
+            x_gateway_signature,
+            claims,
+        )
         resource, action = permission.split(":", 1) if ":" in permission else (permission, "admin")
         if not policy_check(authorization, action=action, resource=resource, tenant_scope=tenant_scope):
             raise HTTPException(status_code=403, detail="Permission denied")
@@ -642,6 +797,7 @@ def write_admin_audit_log(
     resource_type: str,
     resource_id: str = "",
     details: dict[str, Any] | None = None,
+    correlation_id: str | None = None,
 ) -> None:
     session.add(
         AdminAuditLog(
@@ -652,6 +808,7 @@ def write_admin_audit_log(
             details=json.dumps(
                 {
                     "service_identity": SERVICE_SPIFFE_ID,
+                    "correlation_id": correlation_id,
                     **(details or {}),
                 }
             ),
@@ -1086,13 +1243,20 @@ def metrics_prometheus() -> Response:
 @app.middleware("http")
 async def prometheus_http_middleware(request: Request, call_next):
     if not PROMETHEUS_ENABLED:
-        return await call_next(request)
+        response = await call_next(request)
+        request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+        response.headers["x-request-id"] = request_id
+        response.headers["x-correlation-id"] = request_id
+        return response
 
     path = request.url.path
     method = request.method
     start = time.perf_counter()
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    request.state.request_id = request_id
     if TRACER:
         with TRACER.start_as_current_span(f"http {method} {path}"):
+            trace.get_current_span().set_attribute("correlation.id", request_id)
             response = await call_next(request)
     else:
         response = await call_next(request)
@@ -1104,6 +1268,8 @@ async def prometheus_http_middleware(request: Request, call_next):
     PROM_HTTP_REQUESTS_TOTAL.labels(
         service=SERVICE_NAME, env=DEPLOY_ENV, method=method, path=path, status_code=str(response.status_code)
     ).inc()
+    response.headers["x-request-id"] = request_id
+    response.headers["x-correlation-id"] = request_id
     return response
 
 
@@ -1505,8 +1671,24 @@ def sweep_stuck_tasks(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin")
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
     result = sweep_stuck_inflight_tasks()
     with Session(engine) as session:
@@ -1516,6 +1698,7 @@ def sweep_stuck_tasks(
             action="sweep_stuck_tasks",
             resource_type="warmup_queue",
             details=result,
+            correlation_id=x_request_id,
         )
         session.commit()
     return {"swept": True, **result}
@@ -1562,8 +1745,24 @@ def replay_dlq_task(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin")
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
     if payload.item_index >= len(DEAD_LETTER_QUEUE):
         raise HTTPException(status_code=404, detail="DLQ item not found")
@@ -1588,6 +1787,7 @@ def replay_dlq_task(
             resource_type="warmup_event",
             resource_id=str(task.get("event_id", "")),
             details={"queue_name": queue_name, "reason": payload.reason, "approved_by": payload.approved_by},
+            correlation_id=x_request_id,
         )
         session.commit()
 
@@ -1715,6 +1915,141 @@ def content_plan(payload: ContentPlanRequest) -> dict:
     }
 
 
+@app.post("/warmup/seed-mailboxes/ingest")
+def ingest_seed_mailbox(payload: SeedMailboxIngestRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    provider = payload.provider.lower()
+    folder = payload.folder.lower()
+    processed = len(payload.message_ids)
+    sample = payload.message_ids[:5]
+    digest = hashlib.sha256("|".join(sorted(payload.message_ids)).encode("utf-8")).hexdigest() if payload.message_ids else ""
+    json_log(
+        "seed_mailbox_ingested",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        provider=provider,
+        folder=folder,
+        processed=processed,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "provider": provider,
+        "folder": folder,
+        "processed": processed,
+        "message_id_sample": sample,
+        "content_digest": digest,
+    }
+
+
+@app.post("/warmup/reputation/feeds/ingest")
+def ingest_reputation_feed(payload: ReputationFeedIngestRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    provider = payload.provider.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+        risk_delta = 0.2 * payload.confidence if payload.listed else -0.08 * payload.confidence
+        risk = clamp(profile.risk_score + risk_delta, 0.0, 1.0)
+        profile.risk_score = risk
+        profile.reputation_score = clamp(1 - risk, 0.0, 1.0)
+        profile.mode = "throttle" if payload.listed else profile.mode
+        profile.updated_at = utc_now()
+        session.add(
+            RiskSignal(
+                tenant_id=payload.tenant_id,
+                mailbox=mailbox,
+                signal_type="blacklist_feed",
+                severity=risk,
+                details=json.dumps(
+                    {
+                        "provider": provider,
+                        "source": payload.source,
+                        "listed": payload.listed,
+                        "confidence": payload.confidence,
+                    }
+                ),
+            )
+        )
+        session.commit()
+    json_log(
+        "reputation_feed_ingested",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        provider=provider,
+        listed=payload.listed,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "provider": provider,
+        "listed": payload.listed,
+        "risk_score": round(risk, 4),
+    }
+
+
+@app.post("/warmup/content/fingerprint")
+def content_fingerprint(payload: ContentFingerprintRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    canonical = f"{payload.subject.strip().lower()}|{payload.body.strip().lower()}"
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    variant_seed = int(fingerprint[:8], 16) % 7
+    adaptive_hint = f"variant-{variant_seed + 1}"
+    json_log(
+        "content_fingerprint_generated",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        adaptive_hint=adaptive_hint,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "fingerprint": fingerprint,
+        "adaptive_hint": adaptive_hint,
+    }
+
+
+@app.post("/warmup/slo/control-loop")
+def slo_control_loop(payload: SloControlLoopRequest, request: Request) -> dict:
+    mailbox = payload.mailbox.lower()
+    provider = payload.provider.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+        throttled = (
+            payload.send_success_ratio < 0.9
+            or payload.placement_score < 0.7
+            or payload.queue_latency_seconds > 120
+        )
+        if throttled:
+            profile.mode = "throttle"
+            profile.current_daily_target = max(1, int(profile.current_daily_target * 0.8))
+        elif profile.mode == "throttle" and payload.send_success_ratio >= 0.95 and payload.placement_score >= 0.8:
+            profile.mode = "normal"
+            profile.current_daily_target = min(MAX_MAILBOX_DAILY_CAP, profile.current_daily_target + 5)
+        profile.updated_at = utc_now()
+        session.commit()
+        target = profile.current_daily_target
+        mode = profile.mode
+    json_log(
+        "slo_control_loop_applied",
+        tenant_id=payload.tenant_id,
+        mailbox=mailbox,
+        provider=provider,
+        mode=mode,
+        target=target,
+        correlation_id=getattr(request.state, "request_id", None),
+    )
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "provider": provider,
+        "mode": mode,
+        "daily_target": target,
+    }
+
+
 @app.post("/warmup/abuse/check")
 def abuse_check(payload: AbuseCheckRequest) -> dict:
     mailbox = payload.mailbox.lower()
@@ -1767,10 +2102,27 @@ def set_kill_switch(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     global GLOBAL_KILL_SWITCH
     tenant_scope = payload.value if payload.scope == "tenant" else None
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin", tenant_scope=tenant_scope)
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        tenant_scope=tenant_scope,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
 
     if payload.scope == "global":
@@ -1799,6 +2151,7 @@ def set_kill_switch(
             resource_type="kill_switch",
             resource_id=payload.scope,
             details={"enabled": payload.enabled, "value": payload.value},
+            correlation_id=x_request_id,
         )
         session.commit()
 
@@ -1816,8 +2169,25 @@ def upsert_internal_mailbox(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin", tenant_scope=payload.tenant_id)
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        tenant_scope=payload.tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
     mailbox = payload.mailbox.lower()
     provider = provider_from_mailbox(mailbox)
@@ -1843,6 +2213,7 @@ def upsert_internal_mailbox(
             resource_type="internal_mailbox",
             resource_id=f"{payload.tenant_id}:{mailbox}",
             details={"provider": provider, "created": created},
+            correlation_id=x_request_id,
         )
         session.commit()
 
@@ -1857,7 +2228,29 @@ def upsert_internal_mailbox(
 
 
 @app.get("/warmup/admin/internal-mailboxes")
-def list_internal_mailboxes(tenant_id: str | None = None) -> dict:
+def list_internal_mailboxes(
+    tenant_id: str | None = None,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:read",
+        tenant_scope=tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
     with Session(engine) as session:
         stmt = select(InternalMailbox)
         if tenant_id:
@@ -1878,7 +2271,31 @@ def list_internal_mailboxes(tenant_id: str | None = None) -> dict:
 
 
 @app.get("/warmup/admin/mailbox-health")
-def mailbox_health(tenant_id: str, mailbox: str, limit: int = 20) -> dict:
+def mailbox_health(
+    tenant_id: str,
+    mailbox: str,
+    limit: int = 20,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:read",
+        tenant_scope=tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
     mailbox_normalized = mailbox.lower()
     capped_limit = max(1, min(limit, 100))
     with Session(engine) as session:
@@ -1934,7 +2351,30 @@ def mailbox_health(tenant_id: str, mailbox: str, limit: int = 20) -> dict:
 
 
 @app.get("/warmup/admin/audit-logs")
-def list_admin_audit_logs(limit: int = 100) -> dict:
+def list_admin_audit_logs(
+    limit: int = 100,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
+    if claims and claims.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin required")
     capped_limit = max(1, min(limit, 300))
     with Session(engine) as session:
         rows = session.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc()).limit(capped_limit)).all()

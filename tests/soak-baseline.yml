@@ -1,0 +1,18 @@
+soak_test:
+  duration_hours: 6
+  services:
+    - backend
+    - warmup-engine
+    - billing-service
+  checkpoints:
+    every_minutes: 30
+    expectations:
+      - endpoint: http://backend:8000/health
+        status: 200
+      - endpoint: http://warmup_engine:8003/metrics/prometheus
+        status: 200
+      - endpoint: http://billing_service:3001/health
+        status: 200
+  error_budget:
+    request_failure_rate_lt: 0.01
+    queue_growth_unbounded: false

@@ -232,6 +232,8 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./ops/grafana-dashboard-warmup.json:/var/lib/grafana/dashboards/warmup.json:ro
+      - ./ops/grafana-provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./ops/grafana-provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
     ports:
       - "3003:3000"
     networks:

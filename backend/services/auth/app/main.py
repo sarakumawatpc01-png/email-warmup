@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -18,6 +19,22 @@ RETURN_RESET_OTP = os.getenv("RETURN_RESET_OTP", "false").lower() == "true"
 OTP_LENGTH = int(os.getenv("OTP_LENGTH", "8"))
 REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "10080"))
 SERVICE_BOOTSTRAP_TOKEN = os.getenv("SERVICE_BOOTSTRAP_TOKEN", "dev-service-bootstrap")
+AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
+DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev").lower()
+PASSWORD_HASH_ITERATIONS = int(os.getenv("PASSWORD_HASH_ITERATIONS", "390000"))
+
+
+def _is_non_production_env() -> bool:
+    return DEPLOY_ENV in {"dev", "test", "local"}
+
+
+def _enforce_runtime_secrets() -> None:
+    if _is_non_production_env():
+        return
+    if JWT_SECRET == "dev-secret":
+        raise RuntimeError("JWT_SECRET must be set in non-dev environments")
+    if SERVICE_BOOTSTRAP_TOKEN == "dev-service-bootstrap":
+        raise RuntimeError("SERVICE_BOOTSTRAP_TOKEN must be set in non-dev environments")
 
 users: Dict[str, dict] = {}
 reset_otps: Dict[str, dict] = {}
@@ -31,6 +48,75 @@ POLICY_MATRIX: dict[str, list[str]] = {
     "billing.providers.manage": ["*", "billing:manage_providers"],
     "billing.providers.read": ["*", "billing:manage_providers", "billing:read_providers"],
 }
+
+
+def _db_connection() -> sqlite3.Connection:
+    return sqlite3.connect(AUTH_STATE_DB_PATH)
+
+
+def _init_state_store() -> None:
+    with _db_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+                jti TEXT PRIMARY KEY,
+                revoked_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS revoked_sessions (
+                sid TEXT PRIMARY KEY,
+                revoked_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refresh_sessions (
+                sid TEXT PRIMARY KEY,
+                jti TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        revoked_token_ids.update(row[0] for row in conn.execute("SELECT jti FROM revoked_tokens"))
+        revoked_session_ids.update(row[0] for row in conn.execute("SELECT sid FROM revoked_sessions"))
+        refresh_sessions.update({row[0]: row[1] for row in conn.execute("SELECT sid, jti FROM refresh_sessions")})
+
+
+def _persist_refresh_session(sid: str, jti: str) -> None:
+    refresh_sessions[sid] = jti
+    with _db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO refresh_sessions (sid, jti, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(sid) DO UPDATE SET jti=excluded.jti, updated_at=excluded.updated_at
+            """,
+            (sid, jti, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def _revoke_jti(jti: str) -> None:
+    revoked_token_ids.add(jti)
+    with _db_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO revoked_tokens (jti, revoked_at) VALUES (?, ?)",
+            (jti, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def _revoke_sid(sid: str) -> None:
+    revoked_session_ids.add(sid)
+    refresh_sessions.pop(sid, None)
+    with _db_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO revoked_sessions (sid, revoked_at) VALUES (?, ?)",
+            (sid, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute("DELETE FROM refresh_sessions WHERE sid = ?", (sid,))
 
 
 class SignupRequest(BaseModel):
@@ -83,7 +169,28 @@ class AuthorizeRequest(BaseModel):
 
 
 def hash_password(password: str, salt: str) -> str:
-    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${derived.hex()}"
+
+
+def verify_password(password: str, user: dict) -> bool:
+    salt = user["salt"]
+    stored_hash = user.get("password_hash", "")
+    if not isinstance(stored_hash, str) or not stored_hash.startswith("pbkdf2_sha256$"):
+        return False
+    _, iterations, expected = stored_hash.split("$", 2)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        int(iterations),
+    ).hex()
+    return hmac.compare_digest(derived, expected)
 
 
 def _new_jti() -> str:
@@ -96,9 +203,14 @@ def _policy_allows(claims: dict[str, Any], action: str, resource: str, tenant_sc
         return False
     if claims.get("sid") in revoked_session_ids or claims.get("jti") in revoked_token_ids:
         return False
-    if tenant_scope and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_scope:
+    if (
+        tenant_scope
+        and claims.get("role") != "superadmin"
+        and claims.get("token_type") != "service"
+        and claims.get("tenant_id") != tenant_scope
+    ):
         return False
-    matrix_key = f"{action}.{resource}"
+    matrix_key = f"{resource}.{action}"
     allowed = POLICY_MATRIX.get(matrix_key, [])
     return "*" in permissions or any(scope in permissions for scope in allowed)
 
@@ -145,7 +257,7 @@ def issue_access_refresh_pair(email: str, role: str, tenant_id: str, sid: str | 
         expires_minutes=REFRESH_TOKEN_EXPIRE_MINUTES,
     )
     refresh_claims = jwt.decode(refresh_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    refresh_sessions[session_id] = str(refresh_claims.get("jti", ""))
+    _persist_refresh_session(session_id, str(refresh_claims.get("jti", "")))
     return {"access_token": access_token, "refresh_token": refresh_token, "session_id": session_id}
 
 
@@ -157,17 +269,15 @@ def revoke_token_or_session(token: str | None = None, session_id: str | None = N
             jti = claims.get("jti")
             sid = claims.get("sid")
             if isinstance(jti, str):
-                revoked_token_ids.add(jti)
+                _revoke_jti(jti)
                 revoked = True
             if isinstance(sid, str):
-                revoked_session_ids.add(sid)
-                refresh_sessions.pop(sid, None)
+                _revoke_sid(sid)
                 revoked = True
         except jwt.InvalidTokenError:
             return False
     if session_id:
-        revoked_session_ids.add(session_id)
-        refresh_sessions.pop(session_id, None)
+        _revoke_sid(session_id)
         revoked = True
     return revoked
 
@@ -202,8 +312,7 @@ def login(payload: LoginRequest) -> dict:
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    computed = hash_password(payload.password, user["salt"])
-    if not hmac.compare_digest(computed, user["password_hash"]):
+    if not verify_password(payload.password, user):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     tokens = issue_access_refresh_pair(user["email"], user["role"], user["tenant_id"])
@@ -294,15 +403,17 @@ def refresh_token(payload: RefreshRequest) -> dict:
     jti = claims.get("jti")
     if not isinstance(sid, str) or not isinstance(jti, str):
         raise HTTPException(status_code=401, detail="Invalid refresh token claims")
-    if sid in revoked_session_ids or jti in revoked_token_ids:
-        raise HTTPException(status_code=401, detail="Session revoked")
     current_jti = refresh_sessions.get(sid)
+    if sid in revoked_session_ids:
+        raise HTTPException(status_code=401, detail="Session revoked")
+    if jti in revoked_token_ids:
+        _revoke_sid(sid)
+        raise HTTPException(status_code=401, detail="Session revoked")
     if current_jti != jti:
-        revoked_session_ids.add(sid)
-        refresh_sessions.pop(sid, None)
+        _revoke_sid(sid)
         raise HTTPException(status_code=401, detail="Refresh replay detected")
 
-    revoked_token_ids.add(jti)
+    _revoke_jti(jti)
     tokens = issue_access_refresh_pair(claims.get("sub", ""), claims.get("role", "client"), claims.get("tenant_id", ""), sid=sid)
     return {**tokens, "token_type": "bearer", "rotated": True}
 
@@ -321,7 +432,10 @@ def authorize(payload: AuthorizeRequest) -> dict:
 def issue_service_token(payload: ServiceTokenRequest) -> dict:
     if payload.bootstrap_token != SERVICE_BOOTSTRAP_TOKEN:
         raise HTTPException(status_code=403, detail="Bootstrap token denied")
-    permissions = [f"{action}:{resource}" for action in payload.actions for resource in payload.resources]
+    if not payload.actions or not payload.resources:
+        raise HTTPException(status_code=400, detail="actions and resources are required")
+    permissions = [f"{resource}:{action}" for action in payload.actions for resource in payload.resources]
+    permissions = list(dict.fromkeys(permissions))
     sid = f"svc-{payload.service_name}-{secrets.token_hex(6)}"
     token = issue_token(
         email=f"service:{payload.service_name}",
@@ -329,7 +443,7 @@ def issue_service_token(payload: ServiceTokenRequest) -> dict:
         tenant_id="system",
         sid=sid,
         token_type="service",
-        permissions=["*"] + permissions,
+        permissions=permissions,
         expires_minutes=60,
     )
     return {
@@ -342,3 +456,7 @@ def issue_service_token(payload: ServiceTokenRequest) -> dict:
             "mTLS_required": True,
         },
     }
+
+
+_enforce_runtime_secrets()
+_init_state_store()

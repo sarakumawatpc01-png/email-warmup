@@ -41,11 +41,14 @@ def verify(payload: VerificationRequest) -> dict:
         return result
     result["domain"] = True
 
+    transient_issue = False
     try:
         answers = dns.resolver.resolve(domain, "MX")
         mx_hosts = [str(r.exchange).rstrip(".") for r in answers]
         result["mx"] = len(mx_hosts) > 0
     except Exception:
+        transient_issue = True
+        result["status"] = "unknown"
         return result
 
     for host in mx_hosts:
@@ -54,9 +57,12 @@ def verify(payload: VerificationRequest) -> dict:
                 result["smtp"] = True
                 break
         except Exception:
+            transient_issue = True
             continue
 
     if result["syntax"] and result["domain"] and result["mx"]:
         result["status"] = "catch_all_or_valid" if not result["smtp"] else "valid"
+    elif transient_issue and result["syntax"] and result["domain"]:
+        result["status"] = "unknown"
 
     return result

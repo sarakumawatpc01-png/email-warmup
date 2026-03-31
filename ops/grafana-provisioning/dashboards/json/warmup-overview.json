@@ -1,0 +1,51 @@
+{
+  "id": null,
+  "uid": "warmup-overview",
+  "title": "Warmup Overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Warmup HTTP Requests",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(warmup_http_requests_total{service=\"warmup-engine\"}[5m]))",
+          "legendFormat": "rps"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Warmup Queue Backlog",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(warmup_queue_backlog{service=\"warmup-engine\"}) by (queue_name)",
+          "legendFormat": "{{queue_name}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Warmup SLO Signals",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "warmup_slo_send_success_ratio{service=\"warmup-engine\",provider=\"all\"}",
+          "legendFormat": "send_success_ratio"
+        },
+        {
+          "expr": "warmup_slo_placement_score{service=\"warmup-engine\",provider=\"all\"}",
+          "legendFormat": "placement_score"
+        }
+      ]
+    }
+  ]
+}

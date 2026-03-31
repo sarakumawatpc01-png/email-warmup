@@ -1,10 +1,13 @@
 import os
 import time
 import uuid
+import hmac
+import hashlib
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 try:
     from opentelemetry import trace
@@ -61,6 +64,19 @@ SERVICE_IDENTITIES = {
 
 OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
+GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signing-secret")
+DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev").lower()
+
+
+def _is_non_production_env() -> bool:
+    return DEPLOY_ENV in {"dev", "test", "local"}
+
+
+def _enforce_runtime_secrets() -> None:
+    if _is_non_production_env():
+        return
+    if GATEWAY_SIGNING_SECRET == "dev-gateway-signing-secret":
+        raise RuntimeError("GATEWAY_SIGNING_SECRET must be set in non-dev environments")
 
 if trace and TracerProvider and BatchSpanProcessor:
     resource = Resource.create({"service.name": "backend-gateway"}) if Resource else None
@@ -83,12 +99,13 @@ def health() -> dict:
     return {"status": "ok", "service": "gateway"}
 
 
-async def proxy(request: Request, service: str, path: str) -> dict | str:
+async def proxy(request: Request, service: str, path: str) -> Response:
     base = TARGETS[service]
     url = f"{base}/{path}" if path else base
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     request_id = getattr(request.state, "request_id", request.headers.get("x-request-id", str(uuid.uuid4())))
     headers["x-request-id"] = request_id
+    headers["x-correlation-id"] = request_id
     headers["x-caller-service"] = "gateway"
     headers["x-caller-identity"] = "spiffe://email-warmup/gateway"
     headers["x-target-service"] = service
@@ -98,6 +115,23 @@ async def proxy(request: Request, service: str, path: str) -> dict | str:
     if request.headers.get("tracestate"):
         headers["tracestate"] = request.headers["tracestate"]
     body = await request.body()
+    signed_at = str(int(time.time()))
+    canonical = "|".join(
+        [
+            headers["x-caller-service"],
+            headers["x-caller-identity"],
+            headers["x-target-service"],
+            request_id,
+            signed_at,
+        ]
+    )
+    signature = hmac.new(
+        GATEWAY_SIGNING_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    headers["x-gateway-signed-at"] = signed_at
+    headers["x-gateway-signature"] = signature
 
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.request(
@@ -108,13 +142,23 @@ async def proxy(request: Request, service: str, path: str) -> dict | str:
             content=body,
         )
 
-    content_type = response.headers.get("content-type", "")
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-
-    if "application/json" in content_type:
-        return response.json()
-    return response.text
+        detail = (getattr(response, "text", "") or "").strip()
+        if len(detail) > 500:
+            detail = f"{detail[:500]}..."
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=detail or "Upstream service request failed",
+        )
+    forwarded_headers = {}
+    for key in ("content-type", "location", "cache-control", "etag"):
+        value = response.headers.get(key)
+        if value:
+            forwarded_headers[key] = value
+    response_body = getattr(response, "content", None)
+    if response_body is None:
+        response_body = str(getattr(response, "text", "")).encode("utf-8")
+    return Response(content=response_body, status_code=response.status_code, headers=forwarded_headers)
 
 
 @app.middleware("http")
@@ -185,3 +229,11 @@ async def billing_proxy(request: Request, path: str = ""):
 @app.api_route("/whatsapp/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def whatsapp_proxy(request: Request, path: str = ""):
     return await proxy(request, "whatsapp", path)
+
+
+@app.api_route("/crm/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def crm_proxy(request: Request, path: str = ""):
+    return await proxy(request, "crm", path)
+
+
+_enforce_runtime_secrets()

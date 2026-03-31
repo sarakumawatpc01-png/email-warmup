@@ -1,0 +1,14 @@
+replay_scenarios:
+  - name: stripe_webhook_duplicate
+    provider: stripe
+    path: /webhooks/stripe
+    expectation:
+      first_status: 200
+      replay_status: 409
+
+  - name: razorpay_webhook_duplicate
+    provider: razorpay
+    path: /webhooks/razorpay
+    expectation:
+      first_status: 200
+      replay_status: 409
