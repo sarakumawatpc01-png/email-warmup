@@ -167,10 +167,15 @@ def _policy_allows(claims: dict[str, Any], action: str, resource: str, tenant_sc
         return False
     if claims.get("sid") in revoked_session_ids or claims.get("jti") in revoked_token_ids:
         return False
-    if tenant_scope and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_scope:
+    if (
+        tenant_scope
+        and claims.get("role") != "superadmin"
+        and claims.get("token_type") != "service"
+        and claims.get("tenant_id") != tenant_scope
+    ):
         return False
     matrix_key = f"{action}.{resource}"
-    allowed = POLICY_MATRIX.get(matrix_key, [])
+    allowed = POLICY_MATRIX.get(matrix_key, POLICY_MATRIX.get(f"{resource}.{action}", []))
     return "*" in permissions or any(scope in permissions for scope in allowed)
 
 
@@ -389,7 +394,10 @@ def authorize(payload: AuthorizeRequest) -> dict:
 def issue_service_token(payload: ServiceTokenRequest) -> dict:
     if payload.bootstrap_token != SERVICE_BOOTSTRAP_TOKEN:
         raise HTTPException(status_code=403, detail="Bootstrap token denied")
-    permissions = [f"{action}:{resource}" for action in payload.actions for resource in payload.resources]
+    if not payload.actions or not payload.resources:
+        raise HTTPException(status_code=400, detail="actions and resources are required")
+    permissions = [f"{resource}:{action}" for action in payload.actions for resource in payload.resources]
+    permissions = list(dict.fromkeys(permissions))
     sid = f"svc-{payload.service_name}-{secrets.token_hex(6)}"
     token = issue_token(
         email=f"service:{payload.service_name}",
@@ -397,7 +405,7 @@ def issue_service_token(payload: ServiceTokenRequest) -> dict:
         tenant_id="system",
         sid=sid,
         token_type="service",
-        permissions=["*"] + permissions,
+        permissions=permissions,
         expires_minutes=60,
     )
     return {

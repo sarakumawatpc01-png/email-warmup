@@ -1,4 +1,5 @@
 import os
+import sqlite3
 from typing import Optional
 
 import jwt
@@ -10,6 +11,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+pysqlite:///./lead.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 JWT_ALGORITHM = "HS256"
+AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 app = FastAPI(title="Lead Service", version="1.0.0")
@@ -68,9 +70,31 @@ def parse_token(authorization: str = Header(default="")) -> dict:
         claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.InvalidTokenError as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
+    if _is_revoked(claims):
+        raise HTTPException(status_code=401, detail="Token revoked")
     if not claims.get("tenant_id"):
         raise HTTPException(status_code=401, detail="Tenant missing")
     return claims
+
+
+def _is_revoked(claims: dict) -> bool:
+    sid = claims.get("sid")
+    jti = claims.get("jti")
+    if not isinstance(sid, str) and not isinstance(jti, str):
+        return False
+    try:
+        with sqlite3.connect(AUTH_STATE_DB_PATH) as conn:
+            if isinstance(sid, str):
+                row = conn.execute("SELECT 1 FROM revoked_sessions WHERE sid = ? LIMIT 1", (sid,)).fetchone()
+                if row:
+                    return True
+            if isinstance(jti, str):
+                row = conn.execute("SELECT 1 FROM revoked_tokens WHERE jti = ? LIMIT 1", (jti,)).fetchone()
+                if row:
+                    return True
+    except sqlite3.Error:
+        return False
+    return False
 
 
 def _has_any_permission(claims: dict, *needed: str) -> bool:

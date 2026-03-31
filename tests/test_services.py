@@ -150,6 +150,20 @@ def test_auth_service_token_can_authorize_warmup_admin():
     assert decision.json()["allowed"] is True
 
 
+def test_auth_service_token_requires_actions_and_resources():
+    client = TestClient(auth_app)
+    issued = client.post(
+        "/service/token",
+        json={
+            "service_name": "warmup-engine",
+            "actions": [],
+            "resources": [],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 400
+
+
 def test_warmup_job_creation():
     client = TestClient(warmup_app)
     response = client.post(
@@ -608,6 +622,97 @@ def test_lead_requires_permissions_for_create():
         json={"email": "lead@example.com"},
     )
     assert denied.status_code == 403
+
+
+def test_lead_rejects_revoked_session_token():
+    auth_client = TestClient(auth_app)
+    lead_client = TestClient(lead_app)
+    signup = auth_client.post(
+        "/signup",
+        json={
+            "email": f"leadrevoke-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "client",
+            "tenant_id": "tenant-lead-revoke",
+        },
+    )
+    assert signup.status_code == 200
+    token = signup.json()["access_token"]
+    session_id = signup.json()["session_id"]
+
+    created = lead_client.post(
+        "/leads",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"email": f"before-revoke-{uuid.uuid4().hex[:6]}@example.com"},
+    )
+    assert created.status_code == 200
+
+    logout = auth_client.post("/token/logout", json={"session_id": session_id})
+    assert logout.status_code == 200
+
+    denied = lead_client.post(
+        "/leads",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"email": f"after-revoke-{uuid.uuid4().hex[:6]}@example.com"},
+    )
+    assert denied.status_code == 401
+    assert denied.json()["detail"] == "Token revoked"
+
+
+def test_warmup_service_token_requires_gateway_context_headers():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
+    denied = warmup_client.get(
+        "/warmup/admin/audit-logs",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Gateway service context required"
+
+    allowed = warmup_client.get(
+        "/warmup/admin/audit-logs",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "x-caller-service": "gateway",
+            "x-caller-identity": "spiffe://email-warmup/gateway",
+        },
+    )
+    assert allowed.status_code == 200
+
+
+def test_warmup_superadmin_service_token_still_needs_gateway_context():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "warmup-engine",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
+    denied = warmup_client.get(
+        "/warmup/admin/audit-logs",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Gateway service context required"
 
 
 _MAILBOX_STRATEGY = st.builds(

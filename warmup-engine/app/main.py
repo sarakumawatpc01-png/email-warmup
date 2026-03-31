@@ -72,6 +72,7 @@ AUTH_POLICY_URL = os.getenv("AUTH_POLICY_URL", "").rstrip("/")
 POLICY_ENGINE_URL = os.getenv("POLICY_ENGINE_URL", "").rstrip("/")
 POLICY_ENGINE_ADAPTER = os.getenv("POLICY_ENGINE_ADAPTER", "local")
 SERVICE_SPIFFE_ID = os.getenv("WARMUP_SERVICE_SPIFFE_ID", "spiffe://email-warmup/warmup-engine")
+GATEWAY_IDENTITY = os.getenv("GATEWAY_SPIFFE_ID", "spiffe://email-warmup/gateway")
 
 def init_engine():
     try:
@@ -584,6 +585,17 @@ def _is_service_identity(claims: dict[str, Any]) -> bool:
     )
 
 
+def _validate_gateway_service_headers(
+    x_caller_service: str | None,
+    x_caller_identity: str | None,
+    claims: dict[str, Any],
+) -> None:
+    if not _is_service_identity(claims):
+        return
+    if x_caller_service != "gateway" or x_caller_identity != GATEWAY_IDENTITY:
+        raise HTTPException(status_code=403, detail="Gateway service context required")
+
+
 def policy_check(
     authorization: str | None,
     *,
@@ -632,10 +644,13 @@ def require_admin(
     *,
     permission: str = "warmup:admin",
     tenant_scope: str | None = None,
+    x_caller_service: str | None = None,
+    x_caller_identity: str | None = None,
 ) -> dict[str, Any]:
     claims: dict[str, Any] = {}
     if authorization:
         claims = extract_token_claims(authorization)
+        _validate_gateway_service_headers(x_caller_service, x_caller_identity, claims)
         resource, action = permission.split(":", 1) if ":" in permission else (permission, "admin")
         if not policy_check(authorization, action=action, resource=resource, tenant_scope=tenant_scope):
             raise HTTPException(status_code=403, detail="Permission denied")
@@ -1520,8 +1535,16 @@ def sweep_stuck_tasks(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
 ) -> dict:
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin")
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
     result = sweep_stuck_inflight_tasks()
     with Session(engine) as session:
@@ -1577,8 +1600,16 @@ def replay_dlq_task(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
 ) -> dict:
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin")
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
     if payload.item_index >= len(DEAD_LETTER_QUEUE):
         raise HTTPException(status_code=404, detail="DLQ item not found")
@@ -1782,10 +1813,19 @@ def set_kill_switch(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
 ) -> dict:
     global GLOBAL_KILL_SWITCH
     tenant_scope = payload.value if payload.scope == "tenant" else None
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin", tenant_scope=tenant_scope)
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        tenant_scope=tenant_scope,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
 
     if payload.scope == "global":
@@ -1831,8 +1871,17 @@ def upsert_internal_mailbox(
     x_admin_api_key: str | None = Header(default=None),
     x_admin_actor: str = Header(default="system"),
     authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
 ) -> dict:
-    claims = require_admin(x_admin_api_key, authorization, permission="warmup:admin", tenant_scope=payload.tenant_id)
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        tenant_scope=payload.tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+    )
     actor = claims.get("sub") if claims else x_admin_actor
     mailbox = payload.mailbox.lower()
     provider = provider_from_mailbox(mailbox)
@@ -1872,7 +1921,23 @@ def upsert_internal_mailbox(
 
 
 @app.get("/warmup/admin/internal-mailboxes")
-def list_internal_mailboxes(tenant_id: str | None = None) -> dict:
+def list_internal_mailboxes(
+    tenant_id: str | None = None,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:read",
+        tenant_scope=tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+    )
+    if tenant_id and claims and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant scope denied")
     with Session(engine) as session:
         stmt = select(InternalMailbox)
         if tenant_id:
@@ -1893,7 +1958,25 @@ def list_internal_mailboxes(tenant_id: str | None = None) -> dict:
 
 
 @app.get("/warmup/admin/mailbox-health")
-def mailbox_health(tenant_id: str, mailbox: str, limit: int = 20) -> dict:
+def mailbox_health(
+    tenant_id: str,
+    mailbox: str,
+    limit: int = 20,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:read",
+        tenant_scope=tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+    )
+    if claims and claims.get("role") != "superadmin" and claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant scope denied")
     mailbox_normalized = mailbox.lower()
     capped_limit = max(1, min(limit, 100))
     with Session(engine) as session:
@@ -1949,7 +2032,22 @@ def mailbox_health(tenant_id: str, mailbox: str, limit: int = 20) -> dict:
 
 
 @app.get("/warmup/admin/audit-logs")
-def list_admin_audit_logs(limit: int = 100) -> dict:
+def list_admin_audit_logs(
+    limit: int = 100,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+    )
+    if claims and claims.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Superadmin required")
     capped_limit = max(1, min(limit, 300))
     with Session(engine) as session:
         rows = session.scalars(select(AdminAuditLog).order_by(AdminAuditLog.created_at.desc()).limit(capped_limit)).all()
