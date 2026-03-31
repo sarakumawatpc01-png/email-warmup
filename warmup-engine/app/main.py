@@ -86,7 +86,11 @@ def init_engine():
         with candidate.connect() as conn:
             conn.execute(text("SELECT 1"))
         return candidate
-    except Exception:
+    except Exception as exc:
+        if DEPLOY_ENV not in {"dev", "test", "local"}:
+            raise RuntimeError("Warmup database initialization failed") from exc
+        logger = logging.getLogger("warmup-engine")
+        logger.warning("Falling back to SQLite due to database initialization failure: %s", exc)
         return create_engine(SQLITE_FALLBACK_URL, pool_pre_ping=True)
 
 

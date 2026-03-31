@@ -20,6 +20,21 @@ OTP_LENGTH = int(os.getenv("OTP_LENGTH", "8"))
 REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "10080"))
 SERVICE_BOOTSTRAP_TOKEN = os.getenv("SERVICE_BOOTSTRAP_TOKEN", "dev-service-bootstrap")
 AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
+DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev").lower()
+PASSWORD_HASH_ITERATIONS = int(os.getenv("PASSWORD_HASH_ITERATIONS", "390000"))
+
+
+def _is_non_production_env() -> bool:
+    return DEPLOY_ENV in {"dev", "test", "local"}
+
+
+def _enforce_runtime_secrets() -> None:
+    if _is_non_production_env():
+        return
+    if JWT_SECRET == "dev-secret":
+        raise RuntimeError("JWT_SECRET must be set in non-dev environments")
+    if SERVICE_BOOTSTRAP_TOKEN == "dev-service-bootstrap":
+        raise RuntimeError("SERVICE_BOOTSTRAP_TOKEN must be set in non-dev environments")
 
 users: Dict[str, dict] = {}
 reset_otps: Dict[str, dict] = {}
@@ -154,7 +169,33 @@ class AuthorizeRequest(BaseModel):
 
 
 def hash_password(password: str, salt: str) -> str:
-    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    )
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${derived.hex()}"
+
+
+def verify_password(password: str, user: dict) -> bool:
+    salt = user["salt"]
+    stored_hash = user.get("password_hash", "")
+    if isinstance(stored_hash, str) and stored_hash.startswith("pbkdf2_sha256$"):
+        _, iterations, expected = stored_hash.split("$", 2)
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            int(iterations),
+        ).hex()
+        return hmac.compare_digest(derived, expected)
+
+    legacy = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    if hmac.compare_digest(legacy, str(stored_hash)):
+        user["password_hash"] = hash_password(password, salt)
+        return True
+    return False
 
 
 def _new_jti() -> str:
@@ -276,8 +317,7 @@ def login(payload: LoginRequest) -> dict:
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    computed = hash_password(payload.password, user["salt"])
-    if not hmac.compare_digest(computed, user["password_hash"]):
+    if not verify_password(payload.password, user):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     tokens = issue_access_refresh_pair(user["email"], user["role"], user["tenant_id"])
@@ -423,4 +463,5 @@ def issue_service_token(payload: ServiceTokenRequest) -> dict:
     }
 
 
+_enforce_runtime_secrets()
 _init_state_store()
