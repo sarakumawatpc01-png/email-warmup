@@ -209,7 +209,7 @@ async def policy_authorize(request: Request) -> dict:
 async def policy_consensus(request: Request) -> dict:
     caller_service = request.headers.get("x-caller-service", "").strip().lower()
     if caller_service not in TARGETS:
-        raise HTTPException(status_code=403, detail="Service identity required")
+        raise HTTPException(status_code=403, detail="Forbidden")
     return {"consensus_decision": "adopt", "confidence": 0.0, "sources": []}
 
 

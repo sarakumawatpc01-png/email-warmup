@@ -881,7 +881,7 @@ def test_gateway_policy_consensus_requires_service_identity():
     gateway_client = TestClient(gateway_app)
     denied = gateway_client.post("/policy/consensus")
     assert denied.status_code == 403
-    assert denied.json()["detail"] == "Service identity required"
+    assert denied.json()["detail"] == "Forbidden"
 
     allowed = gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"})
     assert allowed.status_code == 200
