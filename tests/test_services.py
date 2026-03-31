@@ -877,6 +877,39 @@ def test_gateway_proxy_adds_signature_headers_for_service_calls():
         gateway_state["httpx"].AsyncClient = original_client
 
 
+def test_gateway_policy_consensus_requires_service_identity():
+    gateway_client = TestClient(gateway_app)
+    denied = gateway_client.post("/policy/consensus")
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Service identity required"
+
+    allowed = gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"})
+    assert allowed.status_code == 200
+    assert allowed.json()["consensus_decision"] == "adopt"
+
+
+def test_gateway_middleware_rejects_invalid_content_length():
+    gateway_client = TestClient(gateway_app)
+    invalid = gateway_client.post(
+        "/policy/consensus",
+        headers={"x-caller-service": "warmup", "content-length": "not-a-number"},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "Invalid Content-Length"
+
+
+def test_gateway_rejects_oversized_proxy_body():
+    gateway_client = TestClient(gateway_app)
+    large = "x" * (11 * 1024 * 1024)
+    response = gateway_client.post(
+        "/auth/signup",
+        content=large,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Request body too large"
+
+
 def test_warmup_phase_h_foundation_endpoints():
     client = TestClient(warmup_app)
     tenant = f"tenant-h-{uuid.uuid4().hex[:6]}"

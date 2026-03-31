@@ -3,11 +3,14 @@ import time
 import uuid
 import hmac
 import hashlib
+import logging
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
+
+logger = logging.getLogger("backend-gateway")
 
 try:
     from opentelemetry import trace
@@ -16,7 +19,8 @@ try:
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-except Exception:  # pragma: no cover - optional runtime capability
+except ImportError as exc:  # pragma: no cover - optional runtime capability
+    logger.warning("OpenTelemetry unavailable; tracing disabled: %s", exc)
     trace = None
     OTLPSpanExporter = None
     FastAPIInstrumentor = None
@@ -66,6 +70,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
 GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signing-secret")
 DEPLOY_ENV = os.getenv("DEPLOY_ENV", "dev").lower()
+GATEWAY_MAX_REQUEST_BYTES = int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", str(10 * 1024 * 1024)))
 
 
 def _is_non_production_env() -> bool:
@@ -115,6 +120,8 @@ async def proxy(request: Request, service: str, path: str) -> Response:
     if request.headers.get("tracestate"):
         headers["tracestate"] = request.headers["tracestate"]
     body = await request.body()
+    if len(body) > GATEWAY_MAX_REQUEST_BYTES:
+        raise HTTPException(status_code=413, detail="Request body too large")
     signed_at = str(int(time.time()))
     canonical = "|".join(
         [
@@ -163,6 +170,13 @@ async def proxy(request: Request, service: str, path: str) -> Response:
 
 @app.middleware("http")
 async def otel_gateway_middleware(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > GATEWAY_MAX_REQUEST_BYTES:
+                return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length"})
     start = time.perf_counter()
     request.state.request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     if TRACER:
@@ -192,7 +206,10 @@ async def policy_authorize(request: Request) -> dict:
 
 
 @app.post("/policy/consensus")
-async def policy_consensus() -> dict:
+async def policy_consensus(request: Request) -> dict:
+    caller_service = request.headers.get("x-caller-service", "").strip().lower()
+    if caller_service not in TARGETS:
+        raise HTTPException(status_code=403, detail="Service identity required")
     return {"consensus_decision": "adopt", "confidence": 0.0, "sources": []}
 
 
