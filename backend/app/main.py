@@ -1,6 +1,8 @@
 import os
 import time
 import uuid
+import hmac
+import hashlib
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -61,6 +63,7 @@ SERVICE_IDENTITIES = {
 
 OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 OTEL_ENABLE_CONSOLE_EXPORTER = os.getenv("OTEL_ENABLE_CONSOLE_EXPORTER", "false").lower() == "true"
+GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signing-secret")
 
 if trace and TracerProvider and BatchSpanProcessor:
     resource = Resource.create({"service.name": "backend-gateway"}) if Resource else None
@@ -98,6 +101,23 @@ async def proxy(request: Request, service: str, path: str) -> dict | str:
     if request.headers.get("tracestate"):
         headers["tracestate"] = request.headers["tracestate"]
     body = await request.body()
+    signed_at = str(int(time.time()))
+    canonical = "|".join(
+        [
+            headers["x-caller-service"],
+            headers["x-caller-identity"],
+            headers["x-target-service"],
+            request_id,
+            signed_at,
+        ]
+    )
+    signature = hmac.new(
+        GATEWAY_SIGNING_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    headers["x-gateway-signed-at"] = signed_at
+    headers["x-gateway-signature"] = signature
 
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.request(

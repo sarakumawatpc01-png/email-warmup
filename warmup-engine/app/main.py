@@ -7,6 +7,8 @@ import os
 import random
 import time
 import uuid
+import hmac
+import hashlib
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -73,6 +75,9 @@ POLICY_ENGINE_URL = os.getenv("POLICY_ENGINE_URL", "").rstrip("/")
 POLICY_ENGINE_ADAPTER = os.getenv("POLICY_ENGINE_ADAPTER", "local")
 SERVICE_SPIFFE_ID = os.getenv("WARMUP_SERVICE_SPIFFE_ID", "spiffe://email-warmup/warmup-engine")
 GATEWAY_IDENTITY = os.getenv("GATEWAY_SPIFFE_ID", "spiffe://email-warmup/gateway")
+GATEWAY_SIGNING_SECRET = os.getenv("GATEWAY_SIGNING_SECRET", "dev-gateway-signing-secret")
+GATEWAY_SIGNATURE_MAX_AGE_SECONDS = int(os.getenv("GATEWAY_SIGNATURE_MAX_AGE_SECONDS", "300"))
+AUTHZ_CACHE_TTL_SECONDS = int(os.getenv("AUTHZ_CACHE_TTL_SECONDS", "5"))
 
 def init_engine():
     try:
@@ -588,12 +593,62 @@ def _is_service_identity(claims: dict[str, Any]) -> bool:
 def _validate_gateway_service_headers(
     x_caller_service: str | None,
     x_caller_identity: str | None,
+    x_target_service: str | None,
+    x_request_id: str | None,
+    x_gateway_signed_at: str | None,
+    x_gateway_signature: str | None,
     claims: dict[str, Any],
 ) -> None:
     if not _is_service_identity(claims):
         return
     if x_caller_service != "gateway" or x_caller_identity != GATEWAY_IDENTITY:
         raise HTTPException(status_code=403, detail="Gateway service context required")
+    if x_target_service != "warmup":
+        raise HTTPException(status_code=403, detail="Gateway target context required")
+    if not x_request_id or not x_gateway_signed_at or not x_gateway_signature:
+        raise HTTPException(status_code=403, detail="Gateway signature required")
+    try:
+        signed_at = int(x_gateway_signed_at)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Invalid gateway signature timestamp") from exc
+    now = int(time.time())
+    if abs(now - signed_at) > GATEWAY_SIGNATURE_MAX_AGE_SECONDS:
+        raise HTTPException(status_code=403, detail="Gateway signature expired")
+    canonical = "|".join([x_caller_service, x_caller_identity, x_target_service, x_request_id, x_gateway_signed_at])
+    expected = hmac.new(
+        GATEWAY_SIGNING_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, x_gateway_signature):
+        raise HTTPException(status_code=403, detail="Gateway signature invalid")
+
+
+class _AuthzCache:
+    def __init__(self, ttl_seconds: int) -> None:
+        self.ttl_seconds = max(1, ttl_seconds)
+        self._store: dict[str, tuple[float, bool]] = {}
+
+    def _key(self, token: str, action: str, resource: str, tenant_scope: str | None) -> str:
+        return "|".join([token, action, resource, tenant_scope or ""])
+
+    def get(self, token: str, action: str, resource: str, tenant_scope: str | None) -> bool | None:
+        key = self._key(token, action, resource, tenant_scope)
+        item = self._store.get(key)
+        if not item:
+            return None
+        expires_at, value = item
+        if expires_at < time.time():
+            self._store.pop(key, None)
+            return None
+        return value
+
+    def set(self, token: str, action: str, resource: str, tenant_scope: str | None, value: bool) -> None:
+        key = self._key(token, action, resource, tenant_scope)
+        self._store[key] = (time.time() + self.ttl_seconds, value)
+
+
+AUTHZ_CACHE = _AuthzCache(AUTHZ_CACHE_TTL_SECONDS)
 
 
 def policy_check(
@@ -605,13 +660,18 @@ def policy_check(
 ) -> bool:
     if not authorization:
         return False
+    token = authorization.removeprefix("Bearer ").strip()
+    cached = AUTHZ_CACHE.get(token, action, resource, tenant_scope)
+    if cached is not None:
+        return cached
     claims = extract_token_claims(authorization)
     if _is_service_identity(claims):
-        return _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+        decision = _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+        AUTHZ_CACHE.set(token, action, resource, tenant_scope, decision)
+        return decision
     if claims.get("sid") or claims.get("jti"):
         if AUTH_POLICY_URL:
             try:
-                token = authorization.removeprefix("Bearer ").strip()
                 response = httpx.post(
                     f"{AUTH_POLICY_URL}/authorize",
                     json={
@@ -624,11 +684,15 @@ def policy_check(
                 )
                 if response.status_code == 200:
                     data = response.json()
-                    return bool(data.get("allowed"))
+                    decision = bool(data.get("allowed"))
+                    AUTHZ_CACHE.set(token, action, resource, tenant_scope, decision)
+                    return decision
                 return False
             except Exception:
                 return False
-    return _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+    decision = _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
+    AUTHZ_CACHE.set(token, action, resource, tenant_scope, decision)
+    return decision
 
 
 def _has_permission(claims: dict[str, Any], permission: str) -> bool:
@@ -646,11 +710,23 @@ def require_admin(
     tenant_scope: str | None = None,
     x_caller_service: str | None = None,
     x_caller_identity: str | None = None,
+    x_target_service: str | None = None,
+    x_request_id: str | None = None,
+    x_gateway_signed_at: str | None = None,
+    x_gateway_signature: str | None = None,
 ) -> dict[str, Any]:
     claims: dict[str, Any] = {}
     if authorization:
         claims = extract_token_claims(authorization)
-        _validate_gateway_service_headers(x_caller_service, x_caller_identity, claims)
+        _validate_gateway_service_headers(
+            x_caller_service,
+            x_caller_identity,
+            x_target_service,
+            x_request_id,
+            x_gateway_signed_at,
+            x_gateway_signature,
+            claims,
+        )
         resource, action = permission.split(":", 1) if ":" in permission else (permission, "admin")
         if not policy_check(authorization, action=action, resource=resource, tenant_scope=tenant_scope):
             raise HTTPException(status_code=403, detail="Permission denied")
@@ -672,6 +748,7 @@ def write_admin_audit_log(
     resource_type: str,
     resource_id: str = "",
     details: dict[str, Any] | None = None,
+    correlation_id: str | None = None,
 ) -> None:
     session.add(
         AdminAuditLog(
@@ -682,6 +759,7 @@ def write_admin_audit_log(
             details=json.dumps(
                 {
                     "service_identity": SERVICE_SPIFFE_ID,
+                    "correlation_id": correlation_id,
                     **(details or {}),
                 }
             ),
@@ -1537,6 +1615,10 @@ def sweep_stuck_tasks(
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
     x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     claims = require_admin(
         x_admin_api_key,
@@ -1544,6 +1626,10 @@ def sweep_stuck_tasks(
         permission="warmup:admin",
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
     )
     actor = claims.get("sub") if claims else x_admin_actor
     result = sweep_stuck_inflight_tasks()
@@ -1554,6 +1640,7 @@ def sweep_stuck_tasks(
             action="sweep_stuck_tasks",
             resource_type="warmup_queue",
             details=result,
+            correlation_id=x_request_id,
         )
         session.commit()
     return {"swept": True, **result}
@@ -1602,6 +1689,10 @@ def replay_dlq_task(
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
     x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     claims = require_admin(
         x_admin_api_key,
@@ -1609,6 +1700,10 @@ def replay_dlq_task(
         permission="warmup:admin",
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
     )
     actor = claims.get("sub") if claims else x_admin_actor
     if payload.item_index >= len(DEAD_LETTER_QUEUE):
@@ -1634,6 +1729,7 @@ def replay_dlq_task(
             resource_type="warmup_event",
             resource_id=str(task.get("event_id", "")),
             details={"queue_name": queue_name, "reason": payload.reason, "approved_by": payload.approved_by},
+            correlation_id=x_request_id,
         )
         session.commit()
 
@@ -1815,6 +1911,10 @@ def set_kill_switch(
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
     x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     global GLOBAL_KILL_SWITCH
     tenant_scope = payload.value if payload.scope == "tenant" else None
@@ -1825,6 +1925,10 @@ def set_kill_switch(
         tenant_scope=tenant_scope,
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
     )
     actor = claims.get("sub") if claims else x_admin_actor
 
@@ -1854,6 +1958,7 @@ def set_kill_switch(
             resource_type="kill_switch",
             resource_id=payload.scope,
             details={"enabled": payload.enabled, "value": payload.value},
+            correlation_id=x_request_id,
         )
         session.commit()
 
@@ -1873,6 +1978,10 @@ def upsert_internal_mailbox(
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
     x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     claims = require_admin(
         x_admin_api_key,
@@ -1881,6 +1990,10 @@ def upsert_internal_mailbox(
         tenant_scope=payload.tenant_id,
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
     )
     actor = claims.get("sub") if claims else x_admin_actor
     mailbox = payload.mailbox.lower()
@@ -1907,6 +2020,7 @@ def upsert_internal_mailbox(
             resource_type="internal_mailbox",
             resource_id=f"{payload.tenant_id}:{mailbox}",
             details={"provider": provider, "created": created},
+            correlation_id=x_request_id,
         )
         session.commit()
 
@@ -1927,6 +2041,10 @@ def list_internal_mailboxes(
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
     x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     claims = require_admin(
         x_admin_api_key,
@@ -1935,6 +2053,10 @@ def list_internal_mailboxes(
         tenant_scope=tenant_id,
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
     )
     with Session(engine) as session:
         stmt = select(InternalMailbox)
@@ -1964,6 +2086,10 @@ def mailbox_health(
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
     x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     claims = require_admin(
         x_admin_api_key,
@@ -1972,6 +2098,10 @@ def mailbox_health(
         tenant_scope=tenant_id,
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
     )
     mailbox_normalized = mailbox.lower()
     capped_limit = max(1, min(limit, 100))
@@ -2034,6 +2164,10 @@ def list_admin_audit_logs(
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
     x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     claims = require_admin(
         x_admin_api_key,
@@ -2041,6 +2175,10 @@ def list_admin_audit_logs(
         permission="warmup:admin",
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
     )
     if claims and claims.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Superadmin required")

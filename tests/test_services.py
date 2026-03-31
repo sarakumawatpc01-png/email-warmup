@@ -6,6 +6,8 @@ import sys
 import tempfile
 import time
 import uuid
+import hmac
+import hashlib
 from pathlib import Path
 
 import jwt
@@ -33,6 +35,34 @@ auth_app = load_app(str(ROOT / "backend/services/auth/app/main.py"))
 warmup_app = load_app(str(ROOT / "warmup-engine/app/main.py"))
 verification_app = load_app(str(ROOT / "verification-engine/app/main.py"))
 lead_app = load_app(str(ROOT / "backend/services/lead-service/app/main.py"))
+gateway_app = load_app(str(ROOT / "backend/app/main.py"))
+
+
+def gateway_signed_headers(token: str, request_id: str, signed_at: int | None = None) -> dict:
+    ts = str(signed_at if signed_at is not None else int(time.time()))
+    canonical = "|".join(
+        [
+            "gateway",
+            "spiffe://email-warmup/gateway",
+            "warmup",
+            request_id,
+            ts,
+        ]
+    )
+    signature = hmac.new(
+        b"dev-gateway-signing-secret",
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "Authorization": f"Bearer {token}",
+        "x-caller-service": "gateway",
+        "x-caller-identity": "spiffe://email-warmup/gateway",
+        "x-target-service": "warmup",
+        "x-request-id": request_id,
+        "x-gateway-signed-at": ts,
+        "x-gateway-signature": signature,
+    }
 
 
 def test_auth_signup_login_and_verify():
@@ -683,11 +713,7 @@ def test_warmup_service_token_requires_gateway_context_headers():
 
     allowed = warmup_client.get(
         "/warmup/admin/audit-logs",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "x-caller-service": "gateway",
-            "x-caller-identity": "spiffe://email-warmup/gateway",
-        },
+        headers=gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}"),
     )
     assert allowed.status_code == 200
 
@@ -713,6 +739,139 @@ def test_warmup_superadmin_service_token_still_needs_gateway_context():
     )
     assert denied.status_code == 403
     assert denied.json()["detail"] == "Gateway service context required"
+
+
+def test_warmup_service_token_rejects_bad_gateway_signature():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
+    headers = gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}")
+    headers["x-gateway-signature"] = "invalid-signature"
+    denied = warmup_client.get("/warmup/admin/audit-logs", headers=headers)
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Gateway signature invalid"
+
+
+def test_warmup_authz_cache_ttl_expires():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
+    headers = gateway_signed_headers(token, request_id=request_id)
+
+    audit_route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/admin/audit-logs")
+    warmup_state = audit_route.endpoint.__globals__
+    cache = warmup_state["AUTHZ_CACHE"]
+    cache._store.clear()
+    cache.ttl_seconds = 1
+
+    allowed = warmup_client.get("/warmup/admin/audit-logs", headers=headers)
+    assert allowed.status_code == 200
+    assert len(cache._store) >= 1
+    cached = cache.get(token, "admin", "warmup", None)
+    assert cached is True
+    time.sleep(1.1)
+    assert cache.get(token, "admin", "warmup", None) is None
+
+
+def test_warmup_admin_audit_logs_include_correlation_id():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
+    tenant = f"tenant-corr-{uuid.uuid4().hex[:6]}"
+    mailbox = f"seed-{uuid.uuid4().hex[:6]}@gmail.com"
+    corr_id = f"corr-{uuid.uuid4().hex[:12]}"
+    upsert = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers=gateway_signed_headers(token, request_id=corr_id),
+        json={"tenant_id": tenant, "mailbox": mailbox, "notes": "corr-test"},
+    )
+    assert upsert.status_code == 200
+
+    logs = warmup_client.get(
+        "/warmup/admin/audit-logs",
+        headers=gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}"),
+    )
+    assert logs.status_code == 200
+    assert any(
+        item["action"] == "internal_mailbox_upsert"
+        and item["resource_id"] == f"{tenant}:{mailbox.lower()}"
+        and item["details"].get("correlation_id") == corr_id
+        for item in logs.json()["items"]
+    )
+
+
+def test_gateway_proxy_adds_signature_headers_for_service_calls():
+    gateway_client = TestClient(gateway_app)
+    warmup_route = next(route for route in gateway_app.router.routes if getattr(route, "path", "") == "/warmup/{path:path}")
+    gateway_state = warmup_route.endpoint.__globals__
+    captured: dict[str, dict] = {}
+    original_client = gateway_state["httpx"].AsyncClient
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {"ok": True}
+
+        text = '{"ok": true}'
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, headers, params, content):
+            captured["headers"] = headers
+            return FakeResponse()
+
+    gateway_state["httpx"].AsyncClient = FakeAsyncClient
+    try:
+        response = gateway_client.get("/warmup/admin/audit-logs")
+        assert response.status_code == 200
+        assert "x-gateway-signature" in captured["headers"]
+        assert "x-gateway-signed-at" in captured["headers"]
+    finally:
+        gateway_state["httpx"].AsyncClient = original_client
 
 
 _MAILBOX_STRATEGY = st.builds(
