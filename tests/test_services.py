@@ -1,8 +1,11 @@
 import importlib.util
+import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
+import jwt
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from fastapi.testclient import TestClient
@@ -19,9 +22,12 @@ def load_app(module_path: str):
 
 
 ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("AUTH_STATE_DB_PATH", f"/tmp/email-warmup-auth-state-{uuid.uuid4().hex}.db")
+os.environ.setdefault("DATABASE_URL", f"sqlite+pysqlite:////tmp/email-warmup-lead-{uuid.uuid4().hex}.db")
 auth_app = load_app(str(ROOT / "backend/services/auth/app/main.py"))
 warmup_app = load_app(str(ROOT / "warmup-engine/app/main.py"))
 verification_app = load_app(str(ROOT / "verification-engine/app/main.py"))
+lead_app = load_app(str(ROOT / "backend/services/lead-service/app/main.py"))
 
 
 def test_auth_signup_login_and_verify():
@@ -67,6 +73,76 @@ def test_auth_tenant_admin_permissions_claims():
     body = verify.json()
     assert body["role"] == "tenant_admin"
     assert "warmup:admin" in body["permissions"]
+
+
+def test_auth_session_revoke_invalidates_verify():
+    client = TestClient(auth_app)
+    signup = client.post(
+        "/signup",
+        json={
+            "email": f"revoke-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "client",
+            "tenant_id": "tenant-revoke",
+        },
+    )
+    assert signup.status_code == 200
+    token = signup.json()["access_token"]
+    session_id = signup.json()["session_id"]
+
+    revoke = client.post("/token/revoke", json={"session_id": session_id})
+    assert revoke.status_code == 200
+
+    verify = client.post("/verify-token", json={"token": token})
+    assert verify.status_code == 401
+
+
+def test_auth_refresh_replay_detection_revokes_session():
+    client = TestClient(auth_app)
+    signup = client.post(
+        "/signup",
+        json={
+            "email": f"refresh-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "client",
+            "tenant_id": "tenant-refresh",
+        },
+    )
+    assert signup.status_code == 200
+    refresh_token = signup.json()["refresh_token"]
+
+    first = client.post("/token/refresh", json={"refresh_token": refresh_token})
+    assert first.status_code == 200
+
+    replay = client.post("/token/refresh", json={"refresh_token": refresh_token})
+    assert replay.status_code == 401
+    assert replay.json()["detail"] == "Refresh replay detected"
+
+    post_replay = client.post("/token/refresh", json={"refresh_token": first.json()["refresh_token"]})
+    assert post_replay.status_code == 401
+    assert post_replay.json()["detail"] == "Session revoked"
+
+
+def test_auth_service_token_can_authorize_warmup_admin():
+    client = TestClient(auth_app)
+    issued = client.post(
+        "/service/token",
+        json={
+            "service_name": "warmup-engine",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
+    decision = client.post(
+        "/authorize",
+        json={"token": token, "action": "admin", "resource": "warmup", "tenant_scope": "tenant-x"},
+    )
+    assert decision.status_code == 200
+    assert decision.json()["allowed"] is True
 
 
 def test_warmup_job_creation():
@@ -504,6 +580,29 @@ def test_warmup_provider_profile_tuning_is_deterministic():
     body = tuned.json()
     assert body["mode"] in {"normal", "rescue", "throttle"}
     assert body["daily_target"] > 0
+
+
+def test_lead_requires_permissions_for_create():
+    lead_client = TestClient(lead_app)
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "sub": "user@example.com",
+            "tenant_id": "tenant-no-perm",
+            "permissions": [],
+            "token_type": "access",
+            "iat": now - 60,
+            "exp": now + 600,
+        },
+        "dev-secret",
+        algorithm="HS256",
+    )
+    denied = lead_client.post(
+        "/leads",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"email": "lead@example.com"},
+    )
+    assert denied.status_code == 403
 
 
 _MAILBOX_STRATEGY = st.builds(

@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -18,6 +19,7 @@ RETURN_RESET_OTP = os.getenv("RETURN_RESET_OTP", "false").lower() == "true"
 OTP_LENGTH = int(os.getenv("OTP_LENGTH", "8"))
 REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES", "10080"))
 SERVICE_BOOTSTRAP_TOKEN = os.getenv("SERVICE_BOOTSTRAP_TOKEN", "dev-service-bootstrap")
+AUTH_STATE_DB_PATH = os.getenv("AUTH_STATE_DB_PATH", "./auth_state.db")
 
 users: Dict[str, dict] = {}
 reset_otps: Dict[str, dict] = {}
@@ -31,6 +33,75 @@ POLICY_MATRIX: dict[str, list[str]] = {
     "billing.providers.manage": ["*", "billing:manage_providers"],
     "billing.providers.read": ["*", "billing:manage_providers", "billing:read_providers"],
 }
+
+
+def _db_connection() -> sqlite3.Connection:
+    return sqlite3.connect(AUTH_STATE_DB_PATH)
+
+
+def _init_state_store() -> None:
+    with _db_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS revoked_tokens (
+                jti TEXT PRIMARY KEY,
+                revoked_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS revoked_sessions (
+                sid TEXT PRIMARY KEY,
+                revoked_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refresh_sessions (
+                sid TEXT PRIMARY KEY,
+                jti TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        revoked_token_ids.update(row[0] for row in conn.execute("SELECT jti FROM revoked_tokens"))
+        revoked_session_ids.update(row[0] for row in conn.execute("SELECT sid FROM revoked_sessions"))
+        refresh_sessions.update({row[0]: row[1] for row in conn.execute("SELECT sid, jti FROM refresh_sessions")})
+
+
+def _persist_refresh_session(sid: str, jti: str) -> None:
+    refresh_sessions[sid] = jti
+    with _db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO refresh_sessions (sid, jti, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(sid) DO UPDATE SET jti=excluded.jti, updated_at=excluded.updated_at
+            """,
+            (sid, jti, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def _revoke_jti(jti: str) -> None:
+    revoked_token_ids.add(jti)
+    with _db_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO revoked_tokens (jti, revoked_at) VALUES (?, ?)",
+            (jti, datetime.now(timezone.utc).isoformat()),
+        )
+
+
+def _revoke_sid(sid: str) -> None:
+    revoked_session_ids.add(sid)
+    refresh_sessions.pop(sid, None)
+    with _db_connection() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO revoked_sessions (sid, revoked_at) VALUES (?, ?)",
+            (sid, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute("DELETE FROM refresh_sessions WHERE sid = ?", (sid,))
 
 
 class SignupRequest(BaseModel):
@@ -145,7 +216,7 @@ def issue_access_refresh_pair(email: str, role: str, tenant_id: str, sid: str | 
         expires_minutes=REFRESH_TOKEN_EXPIRE_MINUTES,
     )
     refresh_claims = jwt.decode(refresh_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    refresh_sessions[session_id] = str(refresh_claims.get("jti", ""))
+    _persist_refresh_session(session_id, str(refresh_claims.get("jti", "")))
     return {"access_token": access_token, "refresh_token": refresh_token, "session_id": session_id}
 
 
@@ -157,17 +228,15 @@ def revoke_token_or_session(token: str | None = None, session_id: str | None = N
             jti = claims.get("jti")
             sid = claims.get("sid")
             if isinstance(jti, str):
-                revoked_token_ids.add(jti)
+                _revoke_jti(jti)
                 revoked = True
             if isinstance(sid, str):
-                revoked_session_ids.add(sid)
-                refresh_sessions.pop(sid, None)
+                _revoke_sid(sid)
                 revoked = True
         except jwt.InvalidTokenError:
             return False
     if session_id:
-        revoked_session_ids.add(session_id)
-        refresh_sessions.pop(session_id, None)
+        _revoke_sid(session_id)
         revoked = True
     return revoked
 
@@ -294,15 +363,16 @@ def refresh_token(payload: RefreshRequest) -> dict:
     jti = claims.get("jti")
     if not isinstance(sid, str) or not isinstance(jti, str):
         raise HTTPException(status_code=401, detail="Invalid refresh token claims")
-    if sid in revoked_session_ids or jti in revoked_token_ids:
+    if sid in revoked_session_ids:
         raise HTTPException(status_code=401, detail="Session revoked")
     current_jti = refresh_sessions.get(sid)
     if current_jti != jti:
-        revoked_session_ids.add(sid)
-        refresh_sessions.pop(sid, None)
+        _revoke_sid(sid)
         raise HTTPException(status_code=401, detail="Refresh replay detected")
+    if jti in revoked_token_ids:
+        raise HTTPException(status_code=401, detail="Session revoked")
 
-    revoked_token_ids.add(jti)
+    _revoke_jti(jti)
     tokens = issue_access_refresh_pair(claims.get("sub", ""), claims.get("role", "client"), claims.get("tenant_id", ""), sid=sid)
     return {**tokens, "token_type": "bearer", "rotated": True}
 
@@ -342,3 +412,6 @@ def issue_service_token(payload: ServiceTokenRequest) -> dict:
             "mTLS_required": True,
         },
     }
+
+
+_init_state_store()

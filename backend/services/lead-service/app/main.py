@@ -73,6 +73,13 @@ def parse_token(authorization: str = Header(default="")) -> dict:
     return claims
 
 
+def _has_any_permission(claims: dict, *needed: str) -> bool:
+    permissions = claims.get("permissions") or []
+    if not isinstance(permissions, list):
+        return False
+    return "*" in permissions or any(item in permissions for item in needed)
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "lead-service"}
@@ -80,6 +87,8 @@ def health() -> dict:
 
 @app.post("/leads", response_model=LeadOut)
 def create_lead(payload: LeadCreate, claims: dict = Depends(parse_token)) -> LeadOut:
+    if not _has_any_permission(claims, "warmup:read", "warmup:admin"):
+        raise HTTPException(status_code=403, detail="Permission denied")
     tenant_id = claims["tenant_id"]
     with Session(engine) as session:
         existing = session.scalar(
@@ -111,6 +120,8 @@ def list_leads(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=200),
 ) -> dict:
+    if not _has_any_permission(claims, "warmup:read", "warmup:admin"):
+        raise HTTPException(status_code=403, detail="Permission denied")
     tenant_id = claims["tenant_id"]
     with Session(engine) as session:
         stmt = select(Lead).where(Lead.tenant_id == tenant_id)
@@ -153,6 +164,8 @@ def list_leads(
 
 @app.post("/leads/bulk")
 def bulk_create(items: list[LeadCreate], claims: dict = Depends(parse_token)) -> dict:
+    if not _has_any_permission(claims, "warmup:read", "warmup:admin"):
+        raise HTTPException(status_code=403, detail="Permission denied")
     tenant_id = claims["tenant_id"]
     normalized_emails = [item.email.lower() for item in items]
     unique_emails = list(dict.fromkeys(normalized_emails))

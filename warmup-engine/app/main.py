@@ -571,6 +571,13 @@ def extract_token_claims(authorization: str | None) -> dict[str, Any]:
     return claims if isinstance(claims, dict) else {}
 
 
+def _is_service_identity(claims: dict[str, Any]) -> bool:
+    token_type = claims.get("token_type")
+    sub = claims.get("sub")
+    sid = claims.get("sid")
+    return token_type == "service" and isinstance(sub, str) and sub.startswith("service:") and isinstance(sid, str) and sid.startswith("svc-")
+
+
 def policy_check(
     authorization: str | None,
     *,
@@ -581,6 +588,8 @@ def policy_check(
     if not authorization:
         return False
     claims = extract_token_claims(authorization)
+    if _is_service_identity(claims):
+        return _has_permission(claims, f"{resource}:{action}") or _has_permission(claims, f"{resource}:admin")
     if claims.get("sid") or claims.get("jti"):
         if AUTH_POLICY_URL:
             try:
