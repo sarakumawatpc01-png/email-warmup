@@ -363,14 +363,12 @@ def refresh_token(payload: RefreshRequest) -> dict:
     jti = claims.get("jti")
     if not isinstance(sid, str) or not isinstance(jti, str):
         raise HTTPException(status_code=401, detail="Invalid refresh token claims")
-    if sid in revoked_session_ids:
-        raise HTTPException(status_code=401, detail="Session revoked")
     current_jti = refresh_sessions.get(sid)
+    if sid in revoked_session_ids or (jti in revoked_token_ids and current_jti == jti):
+        raise HTTPException(status_code=401, detail="Session revoked")
     if current_jti != jti:
         _revoke_sid(sid)
         raise HTTPException(status_code=401, detail="Refresh replay detected")
-    if jti in revoked_token_ids:
-        raise HTTPException(status_code=401, detail="Session revoked")
 
     _revoke_jti(jti)
     tokens = issue_access_refresh_pair(claims.get("sub", ""), claims.get("role", "client"), claims.get("tenant_id", ""), sid=sid)

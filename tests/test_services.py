@@ -1,6 +1,9 @@
 import importlib.util
+import atexit
+import shutil
 import os
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -22,8 +25,10 @@ def load_app(module_path: str):
 
 
 ROOT = Path(__file__).resolve().parents[1]
-os.environ.setdefault("AUTH_STATE_DB_PATH", f"/tmp/email-warmup-auth-state-{uuid.uuid4().hex}.db")
-os.environ.setdefault("DATABASE_URL", f"sqlite+pysqlite:////tmp/email-warmup-lead-{uuid.uuid4().hex}.db")
+TMP_DIR = Path(tempfile.mkdtemp(prefix="email-warmup-tests-"))
+atexit.register(shutil.rmtree, TMP_DIR, True)
+os.environ.setdefault("AUTH_STATE_DB_PATH", str(TMP_DIR / f"email-warmup-auth-state-{uuid.uuid4().hex}.db"))
+os.environ.setdefault("DATABASE_URL", f"sqlite+pysqlite:///{TMP_DIR / f'email-warmup-lead-{uuid.uuid4().hex}.db'}")
 auth_app = load_app(str(ROOT / "backend/services/auth/app/main.py"))
 warmup_app = load_app(str(ROOT / "warmup-engine/app/main.py"))
 verification_app = load_app(str(ROOT / "verification-engine/app/main.py"))

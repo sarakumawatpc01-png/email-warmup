@@ -575,7 +575,13 @@ def _is_service_identity(claims: dict[str, Any]) -> bool:
     token_type = claims.get("token_type")
     sub = claims.get("sub")
     sid = claims.get("sid")
-    return token_type == "service" and isinstance(sub, str) and sub.startswith("service:") and isinstance(sid, str) and sid.startswith("svc-")
+    return (
+        token_type == "service"
+        and isinstance(sub, str)
+        and sub.startswith("service:")
+        and isinstance(sid, str)
+        and sid.startswith("svc-")
+    )
 
 
 def policy_check(
