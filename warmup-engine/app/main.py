@@ -951,6 +951,8 @@ def write_admin_audit_log(
     correlation_id: str | None = None,
 ) -> None:
     normalized_details = dict(details or {})
+    normalized_details.pop("resource_type", None)
+    normalized_details.pop("resource_id", None)
     if "tenant_id" not in normalized_details:
         if resource_id and ":" in resource_id:
             normalized_details["tenant_id"] = resource_id.split(":", 1)[0]
@@ -1347,12 +1349,7 @@ def update_certification_and_record_decision(
         queue_latency_seconds=queue_latency_seconds,
     )
     proposed_tier = tier_from_score(score, hard_fail)
-    if certification_tier_rank(proposed_tier) > certification_tier_rank(previous_tier):
-        next_tier = proposed_tier
-    elif certification_tier_rank(proposed_tier) < certification_tier_rank(previous_tier):
-        next_tier = proposed_tier
-    else:
-        next_tier = previous_tier
+    next_tier = proposed_tier
 
     hard_fail_streak_days = state.hard_fail_streak_days + 1 if hard_fail else 0
     global_benchmark_qualified = (
@@ -2728,9 +2725,10 @@ def list_internal_mailboxes(
     x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
     raw_claims = extract_token_claims(authorization) if authorization else {}
-    tenant_scope_for_auth = _admin_tenant_scope(raw_claims, tenant_id)
     if raw_claims and raw_claims.get("role") != "superadmin":
         tenant_scope_for_auth = raw_claims.get("tenant_id")
+    else:
+        tenant_scope_for_auth = _admin_tenant_scope(raw_claims, tenant_id)
     claims = require_admin(
         x_admin_api_key,
         authorization,
