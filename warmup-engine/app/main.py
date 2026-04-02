@@ -86,6 +86,11 @@ SECRETS_MANAGER_URL = os.getenv("SECRETS_MANAGER_URL", "").rstrip("/")
 SECRETS_MANAGER_TOKEN = os.getenv("SECRETS_MANAGER_TOKEN", "")
 ADMIN_RATE_LIMIT_PER_MINUTE = int(os.getenv("WARMUP_ADMIN_RATE_LIMIT_PER_MINUTE", "30"))
 AUDIT_LOG_RETENTION_DAYS = int(os.getenv("AUDIT_LOG_RETENTION_DAYS", "90"))
+ADMIN_INTERNAL_MAILBOXES_MAX_LIMIT = int(os.getenv("WARMUP_ADMIN_INTERNAL_MAILBOXES_MAX_LIMIT", "200"))
+ADMIN_INTERNAL_MAILBOXES_DEFAULT_LIMIT = int(os.getenv("WARMUP_ADMIN_INTERNAL_MAILBOXES_DEFAULT_LIMIT", "100"))
+ADMIN_MAILBOX_HEALTH_MAX_LIMIT = int(os.getenv("WARMUP_ADMIN_MAILBOX_HEALTH_MAX_LIMIT", "50"))
+ADMIN_AUDIT_LOGS_MAX_LIMIT = int(os.getenv("WARMUP_ADMIN_AUDIT_LOGS_MAX_LIMIT", "200"))
+ADMIN_AUDIT_EXPORT_MAX_LIMIT = int(os.getenv("WARMUP_ADMIN_AUDIT_EXPORT_MAX_LIMIT", "300"))
 SLO_THROTTLE_SEND_SUCCESS_THRESHOLD = float(os.getenv("SLO_THROTTLE_SEND_SUCCESS_THRESHOLD", "0.9"))
 SLO_THROTTLE_PLACEMENT_THRESHOLD = float(os.getenv("SLO_THROTTLE_PLACEMENT_THRESHOLD", "0.7"))
 SLO_THROTTLE_QUEUE_LATENCY_THRESHOLD_SECONDS = float(os.getenv("SLO_THROTTLE_QUEUE_LATENCY_THRESHOLD_SECONDS", "120"))
@@ -876,6 +881,12 @@ def write_admin_audit_log(
     details: dict[str, Any] | None = None,
     correlation_id: str | None = None,
 ) -> None:
+    normalized_details = dict(details or {})
+    if "tenant_id" not in normalized_details:
+        if resource_id and ":" in resource_id:
+            normalized_details["tenant_id"] = resource_id.split(":", 1)[0]
+        else:
+            normalized_details["tenant_id"] = "unknown"
     session.add(
         AdminAuditLog(
             actor=actor,
@@ -886,11 +897,33 @@ def write_admin_audit_log(
                 {
                     "service_identity": SERVICE_SPIFFE_ID,
                     "correlation_id": correlation_id,
-                    **(details or {}),
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    **normalized_details,
                 }
             ),
         )
     )
+
+
+def _admin_tenant_scope(claims: dict[str, Any], requested_tenant_id: str | None) -> str | None:
+    if not claims:
+        return requested_tenant_id
+    if claims.get("role") == "superadmin":
+        return requested_tenant_id
+    claim_tenant_id = claims.get("tenant_id")
+    if isinstance(claim_tenant_id, str) and claim_tenant_id:
+        return claim_tenant_id
+    return requested_tenant_id
+
+
+def _sanitize_limit(limit: int, *, default: int, ceiling: int) -> int:
+    normalized_ceiling = ceiling if ceiling > 0 else 1
+    return max(1, min(limit if limit > 0 else default, normalized_ceiling))
+
+
+def _sanitize_offset(offset: int) -> int:
+    return max(0, offset)
 
 
 def resolve_policy_decision(profile: MailboxProfile, risk: float, blacklist_detected: bool) -> tuple[int, str, str]:
@@ -2372,6 +2405,8 @@ def upsert_internal_mailbox(
 @app.get("/warmup/admin/internal-mailboxes")
 def list_internal_mailboxes(
     tenant_id: str | None = None,
+    limit: int = ADMIN_INTERNAL_MAILBOXES_DEFAULT_LIMIT,
+    offset: int = 0,
     x_admin_api_key: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
     x_caller_service: str | None = Header(default=None),
@@ -2381,11 +2416,15 @@ def list_internal_mailboxes(
     x_gateway_signed_at: str | None = Header(default=None),
     x_gateway_signature: str | None = Header(default=None),
 ) -> dict:
+    raw_claims = extract_token_claims(authorization) if authorization else {}
+    tenant_scope_for_auth = _admin_tenant_scope(raw_claims, tenant_id)
+    if raw_claims and raw_claims.get("role") != "superadmin":
+        tenant_scope_for_auth = raw_claims.get("tenant_id")
     claims = require_admin(
         x_admin_api_key,
         authorization,
         permission="warmup:read",
-        tenant_scope=tenant_id,
+        tenant_scope=tenant_scope_for_auth,
         x_caller_service=x_caller_service,
         x_caller_identity=x_caller_identity,
         x_target_service=x_target_service,
@@ -2393,12 +2432,24 @@ def list_internal_mailboxes(
         x_gateway_signed_at=x_gateway_signed_at,
         x_gateway_signature=x_gateway_signature,
     )
+    tenant_filter = _admin_tenant_scope(claims, tenant_id)
+    capped_limit = _sanitize_limit(
+        limit, default=ADMIN_INTERNAL_MAILBOXES_DEFAULT_LIMIT, ceiling=ADMIN_INTERNAL_MAILBOXES_MAX_LIMIT
+    )
+    safe_offset = _sanitize_offset(offset)
     with Session(engine) as session:
         stmt = select(InternalMailbox)
-        if tenant_id:
-            stmt = stmt.where(InternalMailbox.tenant_id == tenant_id)
-        records = session.scalars(stmt.order_by(InternalMailbox.tenant_id, InternalMailbox.mailbox)).all()
+        if tenant_filter:
+            stmt = stmt.where(InternalMailbox.tenant_id == tenant_filter)
+        total = int(session.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+        records = session.scalars(
+            stmt.order_by(InternalMailbox.tenant_id, InternalMailbox.mailbox).offset(safe_offset).limit(capped_limit)
+        ).all()
         return {
+            "tenant_scope": tenant_filter,
+            "limit": capped_limit,
+            "offset": safe_offset,
+            "total": total,
             "items": [
                 {
                     "tenant_id": record.tenant_id,
@@ -2438,8 +2489,11 @@ def mailbox_health(
         x_gateway_signed_at=x_gateway_signed_at,
         x_gateway_signature=x_gateway_signature,
     )
+    tenant_scope = _admin_tenant_scope(claims, tenant_id)
+    if tenant_scope and tenant_scope != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant scope denied")
     mailbox_normalized = mailbox.lower()
-    capped_limit = max(1, min(limit, 100))
+    capped_limit = _sanitize_limit(limit, default=20, ceiling=ADMIN_MAILBOX_HEALTH_MAX_LIMIT)
     with Session(engine) as session:
         profile = session.scalar(
             select(MailboxProfile).where(MailboxProfile.tenant_id == tenant_id, MailboxProfile.mailbox == mailbox_normalized)
@@ -2495,6 +2549,7 @@ def mailbox_health(
 @app.get("/warmup/admin/audit-logs")
 def list_admin_audit_logs(
     limit: int = 100,
+    offset: int = 0,
     actor: str | None = None,
     action: str | None = None,
     resource_type: str | None = None,
@@ -2521,7 +2576,8 @@ def list_admin_audit_logs(
     )
     if claims and claims.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Superadmin required")
-    capped_limit = max(1, min(limit, 300))
+    capped_limit = _sanitize_limit(limit, default=100, ceiling=ADMIN_AUDIT_LOGS_MAX_LIMIT)
+    safe_offset = _sanitize_offset(offset)
     with Session(engine) as session:
         stmt = select(AdminAuditLog)
         if actor:
@@ -2536,8 +2592,14 @@ def list_admin_audit_logs(
                 stmt = stmt.where(AdminAuditLog.created_at >= since_ts)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Invalid since timestamp") from exc
-        rows = session.scalars(stmt.order_by(AdminAuditLog.created_at.desc()).limit(capped_limit)).all()
+        total = int(session.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+        rows = session.scalars(
+            stmt.order_by(AdminAuditLog.created_at.desc()).offset(safe_offset).limit(capped_limit)
+        ).all()
         return {
+            "limit": capped_limit,
+            "offset": safe_offset,
+            "total": total,
             "items": [
                 {
                     "actor": row.actor,
@@ -2581,7 +2643,7 @@ def export_admin_audit_logs_csv(
     )
     if claims and claims.get("role") != "superadmin":
         raise HTTPException(status_code=403, detail="Superadmin required")
-    capped_limit = max(1, min(limit, 500))
+    capped_limit = _sanitize_limit(limit, default=100, ceiling=ADMIN_AUDIT_EXPORT_MAX_LIMIT)
     with Session(engine) as session:
         stmt = select(AdminAuditLog)
         if actor:

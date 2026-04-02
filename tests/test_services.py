@@ -1022,6 +1022,116 @@ def test_warmup_admin_audit_export_and_filter():
     filtered = warmup_client.get("/warmup/admin/audit-logs?limit=5&action=internal_mailbox_upsert", headers=headers)
     assert filtered.status_code == 200
     assert "items" in filtered.json()
+    assert filtered.json()["limit"] == 5
+    assert filtered.json()["offset"] == 0
+    assert isinstance(filtered.json()["total"], int)
+
+
+def test_warmup_admin_internal_mailboxes_enforces_tenant_scope_and_pagination():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    signup = auth_client.post(
+        "/signup",
+        json={
+            "email": f"tenant-scope-list-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "tenant_admin",
+            "tenant_id": "tenant-scope-list-a",
+        },
+    )
+    assert signup.status_code == 200
+    token = signup.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers=headers,
+        json={
+            "tenant_id": "tenant-scope-list-a",
+            "mailbox": f"scope-a-{uuid.uuid4().hex[:6]}@gmail.com",
+            "notes": "tenant a",
+        },
+    )
+    assert first.status_code == 200
+
+    second = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers=headers,
+        json={
+            "tenant_id": "tenant-scope-list-a",
+            "mailbox": f"scope-a2-{uuid.uuid4().hex[:6]}@gmail.com",
+            "notes": "tenant a 2",
+        },
+    )
+    assert second.status_code == 200
+
+    listed = warmup_client.get(
+        "/warmup/admin/internal-mailboxes?tenant_id=tenant-other&limit=1&offset=0",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["tenant_scope"] == "tenant-scope-list-a"
+    assert body["limit"] == 1
+    assert body["offset"] == 0
+    assert body["total"] >= 2
+    assert len(body["items"]) == 1
+    assert all(item["tenant_id"] == "tenant-scope-list-a" for item in body["items"])
+
+    paged = warmup_client.get(
+        "/warmup/admin/internal-mailboxes?limit=5000&offset=-10",
+        headers=headers,
+    )
+    assert paged.status_code == 200
+    paged_body = paged.json()
+    assert paged_body["limit"] == 200
+    assert paged_body["offset"] == 0
+    assert all(item["tenant_id"] == "tenant-scope-list-a" for item in paged_body["items"])
+
+
+def test_warmup_admin_audit_log_details_have_consistent_resource_enrichment():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
+    tenant = f"tenant-audit-enrich-{uuid.uuid4().hex[:6]}"
+    mailbox = f"enrich-{uuid.uuid4().hex[:6]}@gmail.com"
+    corr = f"req-{uuid.uuid4().hex[:12]}"
+    upsert = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers=gateway_signed_headers(token, request_id=corr),
+        json={"tenant_id": tenant, "mailbox": mailbox, "notes": "enrichment"},
+    )
+    assert upsert.status_code == 200
+
+    logs = warmup_client.get(
+        "/warmup/admin/audit-logs?limit=10",
+        headers=gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}"),
+    )
+    assert logs.status_code == 200
+    match = next(
+        (
+            item
+            for item in logs.json()["items"]
+            if item["action"] == "internal_mailbox_upsert" and item["resource_id"] == f"{tenant}:{mailbox.lower()}"
+        ),
+        None,
+    )
+    assert match is not None
+    details = match["details"]
+    assert details.get("resource_type") == "internal_mailbox"
+    assert details.get("resource_id") == f"{tenant}:{mailbox.lower()}"
+    assert details.get("tenant_id") == tenant
 
 
 def test_end_to_end_auth_lead_warmup_and_admin_flow():
