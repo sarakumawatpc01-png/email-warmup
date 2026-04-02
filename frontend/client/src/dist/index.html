@@ -1,0 +1,125 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Client Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-slate-50 text-slate-900">
+    <div class="max-w-5xl mx-auto p-6">
+      <h1 class="text-2xl font-bold mb-4">Client Dashboard</h1>
+      <div id="client-banner" class="hidden mb-3 rounded border px-3 py-2 text-sm"></div>
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+        <div class="bg-white p-4 rounded shadow">Campaigns: 3</div>
+        <div class="bg-white p-4 rounded shadow">Leads: 1,240</div>
+        <div class="bg-white p-4 rounded shadow">Warm-up Jobs: 2</div>
+        <div class="bg-white p-4 rounded shadow">CRM Open Items: 18</div>
+      </div>
+      <div class="bg-white p-4 rounded shadow">
+        <h2 class="font-semibold mb-2">Quick Actions</h2>
+        <div class="grid md:grid-cols-4 gap-2 mb-3">
+          <input id="client-email" class="border rounded px-2 py-1 md:col-span-2" placeholder="lead email" />
+          <input id="client-company" class="border rounded px-2 py-1" placeholder="company (optional)" />
+          <button id="client-add-lead" class="bg-indigo-600 text-white rounded px-3 py-1">Upload Lead</button>
+        </div>
+        <div class="grid md:grid-cols-4 gap-2 mb-3">
+          <input id="client-tenant" class="border rounded px-2 py-1" placeholder="tenant_id" />
+          <input id="client-mailbox" class="border rounded px-2 py-1" placeholder="mailbox" />
+          <input id="client-domain-age" class="border rounded px-2 py-1" value="45" />
+          <button id="client-start-warmup" class="bg-emerald-600 text-white rounded px-3 py-1">Start Warm-up</button>
+        </div>
+        <pre id="client-output" class="bg-gray-50 border rounded p-2 text-xs overflow-auto max-h-72"></pre>
+      </div>
+    </div>
+    <script>
+      const q = (id) => document.getElementById(id);
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': localStorage.getItem('client_auth_token') ? ('Bearer ' + localStorage.getItem('client_auth_token')) : '',
+      };
+      const banner = (text, level = 'info') => {
+        const el = q('client-banner');
+        el.classList.remove('hidden', 'border-red-200', 'bg-red-50', 'text-red-700', 'border-emerald-200', 'bg-emerald-50', 'text-emerald-700');
+        if (level === 'error') {
+          el.classList.add('border-red-200', 'bg-red-50', 'text-red-700');
+        } else {
+          el.classList.add('border-emerald-200', 'bg-emerald-50', 'text-emerald-700');
+        }
+        el.textContent = text;
+      };
+      const validateEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email || '');
+      const withLoading = async (btn, action) => {
+        const original = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Working...';
+        try {
+          await action();
+        } finally {
+          btn.disabled = false;
+          btn.textContent = original;
+        }
+      };
+      q('client-add-lead').onclick = () => withLoading(q('client-add-lead'), async () => {
+        const email = q('client-email').value.trim().toLowerCase();
+        const company = q('client-company').value.trim();
+        if (!validateEmail(email)) {
+          banner('Please provide a valid lead email address.', 'error');
+          return;
+        }
+        try {
+          const res = await fetch('/leads/leads', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ email, company: company || null })
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.detail || data.error || 'Unable to create lead');
+          }
+          banner('Lead uploaded successfully.');
+          q('client-output').textContent = JSON.stringify(data, null, 2);
+        } catch (error) {
+          banner(error.message || 'Lead upload failed', 'error');
+        }
+      });
+      q('client-start-warmup').onclick = () => withLoading(q('client-start-warmup'), async () => {
+        const tenantId = q('client-tenant').value.trim();
+        const mailbox = q('client-mailbox').value.trim().toLowerCase();
+        const domainAgeDays = Number(q('client-domain-age').value || '0');
+        if (!tenantId || tenantId.length < 2) {
+          banner('tenant_id must be at least 2 characters.', 'error');
+          return;
+        }
+        if (!validateEmail(mailbox)) {
+          banner('Please provide a valid mailbox email.', 'error');
+          return;
+        }
+        if (!Number.isFinite(domainAgeDays) || domainAgeDays < 0) {
+          banner('Domain age must be a non-negative number.', 'error');
+          return;
+        }
+        try {
+          const res = await fetch('/warmup/warmup/jobs', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              tenant_id: tenantId,
+              mailbox,
+              domain_age_days: domainAgeDays,
+              blacklist_detected: false
+            })
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.detail || data.error || 'Unable to start warmup');
+          }
+          banner('Warmup started successfully.');
+          q('client-output').textContent = JSON.stringify(data, null, 2);
+        } catch (error) {
+          banner(error.message || 'Warmup start failed', 'error');
+        }
+      });
+    </script>
+  </body>
+</html>

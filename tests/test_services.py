@@ -883,7 +883,13 @@ def test_gateway_policy_consensus_requires_service_identity():
     assert denied.status_code == 403
     assert denied.json()["detail"] == "Forbidden"
 
-    allowed = gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"})
+    allowed = gateway_client.post(
+        "/policy/consensus",
+        headers={
+            "x-caller-service": "warmup",
+            "x-caller-identity": "spiffe://email-warmup/warmup-engine",
+        },
+    )
     assert allowed.status_code == 200
     assert allowed.json()["consensus_decision"] == "adopt"
 
@@ -892,7 +898,11 @@ def test_gateway_middleware_rejects_invalid_content_length():
     gateway_client = TestClient(gateway_app)
     invalid = gateway_client.post(
         "/policy/consensus",
-        headers={"x-caller-service": "warmup", "content-length": "not-a-number"},
+        headers={
+            "x-caller-service": "warmup",
+            "x-caller-identity": "spiffe://email-warmup/warmup-engine",
+            "content-length": "not-a-number",
+        },
     )
     assert invalid.status_code == 400
     assert invalid.json()["detail"] == "Invalid Content-Length"
@@ -918,10 +928,29 @@ def test_gateway_policy_rate_limit_applies():
     gateway_state["GATEWAY_ADMIN_RATE_WINDOW_SECONDS"] = 60
     gateway_state["_RATE_LIMIT_BUCKETS"].clear()
 
-    assert gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"}).status_code == 200
-    assert gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"}).status_code == 200
-    limited = gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"})
+    headers = {
+        "x-caller-service": "warmup",
+        "x-caller-identity": "spiffe://email-warmup/warmup-engine",
+    }
+    assert gateway_client.post("/policy/consensus", headers=headers).status_code == 200
+    assert gateway_client.post("/policy/consensus", headers=headers).status_code == 200
+    limited = gateway_client.post("/policy/consensus", headers=headers)
     assert limited.status_code == 429
+
+
+def test_gateway_policy_consensus_rejects_mismatched_service_identity():
+    gateway_client = TestClient(gateway_app)
+    route = next(route for route in gateway_app.router.routes if getattr(route, "path", "") == "/policy/consensus")
+    gateway_state = route.endpoint.__globals__
+    gateway_state["_RATE_LIMIT_BUCKETS"].clear()
+    denied = gateway_client.post(
+        "/policy/consensus",
+        headers={
+            "x-caller-service": "warmup",
+            "x-caller-identity": "spiffe://email-warmup/auth",
+        },
+    )
+    assert denied.status_code == 403
 
 
 def test_auth_rate_limit_signup_applies():
@@ -993,6 +1022,116 @@ def test_warmup_admin_audit_export_and_filter():
     filtered = warmup_client.get("/warmup/admin/audit-logs?limit=5&action=internal_mailbox_upsert", headers=headers)
     assert filtered.status_code == 200
     assert "items" in filtered.json()
+    assert filtered.json()["limit"] == 5
+    assert filtered.json()["offset"] == 0
+    assert isinstance(filtered.json()["total"], int)
+
+
+def test_warmup_admin_internal_mailboxes_enforces_tenant_scope_and_pagination():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    signup = auth_client.post(
+        "/signup",
+        json={
+            "email": f"tenant-scope-list-{uuid.uuid4().hex[:6]}@example.com",
+            "password": "StrongPass123",
+            "role": "tenant_admin",
+            "tenant_id": "tenant-scope-list-a",
+        },
+    )
+    assert signup.status_code == 200
+    token = signup.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers=headers,
+        json={
+            "tenant_id": "tenant-scope-list-a",
+            "mailbox": f"scope-a-{uuid.uuid4().hex[:6]}@gmail.com",
+            "notes": "tenant a",
+        },
+    )
+    assert first.status_code == 200
+
+    second = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers=headers,
+        json={
+            "tenant_id": "tenant-scope-list-a",
+            "mailbox": f"scope-a2-{uuid.uuid4().hex[:6]}@gmail.com",
+            "notes": "tenant a 2",
+        },
+    )
+    assert second.status_code == 200
+
+    listed = warmup_client.get(
+        "/warmup/admin/internal-mailboxes?tenant_id=tenant-other&limit=1&offset=0",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["tenant_scope"] == "tenant-scope-list-a"
+    assert body["limit"] == 1
+    assert body["offset"] == 0
+    assert body["total"] >= 2
+    assert len(body["items"]) == 1
+    assert all(item["tenant_id"] == "tenant-scope-list-a" for item in body["items"])
+
+    paged = warmup_client.get(
+        "/warmup/admin/internal-mailboxes?limit=5000&offset=-10",
+        headers=headers,
+    )
+    assert paged.status_code == 200
+    paged_body = paged.json()
+    assert paged_body["limit"] == 200
+    assert paged_body["offset"] == 0
+    assert all(item["tenant_id"] == "tenant-scope-list-a" for item in paged_body["items"])
+
+
+def test_warmup_admin_audit_log_details_have_consistent_resource_enrichment():
+    auth_client = TestClient(auth_app)
+    warmup_client = TestClient(warmup_app)
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
+    tenant = f"tenant-audit-enrich-{uuid.uuid4().hex[:6]}"
+    mailbox = f"enrich-{uuid.uuid4().hex[:6]}@gmail.com"
+    corr = f"req-{uuid.uuid4().hex[:12]}"
+    upsert = warmup_client.post(
+        "/warmup/admin/internal-mailboxes",
+        headers=gateway_signed_headers(token, request_id=corr),
+        json={"tenant_id": tenant, "mailbox": mailbox, "notes": "enrichment"},
+    )
+    assert upsert.status_code == 200
+
+    logs = warmup_client.get(
+        "/warmup/admin/audit-logs?limit=10",
+        headers=gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}"),
+    )
+    assert logs.status_code == 200
+    match = next(
+        (
+            item
+            for item in logs.json()["items"]
+            if item["action"] == "internal_mailbox_upsert" and item["resource_id"] == f"{tenant}:{mailbox.lower()}"
+        ),
+        None,
+    )
+    assert match is not None
+    details = match["details"]
+    assert details.get("resource_type") == "internal_mailbox"
+    assert details.get("resource_id") == f"{tenant}:{mailbox.lower()}"
+    assert details.get("tenant_id") == tenant
 
 
 def test_end_to_end_auth_lead_warmup_and_admin_flow():
@@ -1063,6 +1202,7 @@ def test_end_to_end_auth_lead_warmup_and_admin_flow():
 
 def test_warmup_phase_h_foundation_endpoints():
     client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
     tenant = f"tenant-h-{uuid.uuid4().hex[:6]}"
     mailbox = f"h-{uuid.uuid4().hex[:6]}@gmail.com"
 
@@ -1100,8 +1240,21 @@ def test_warmup_phase_h_foundation_endpoints():
     assert fingerprint.status_code == 200
     assert len(fingerprint.json()["fingerprint"]) == 64
 
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
     control = client.post(
         "/warmup/slo/control-loop",
+        headers=gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}"),
         json={
             "tenant_id": tenant,
             "mailbox": mailbox,
@@ -1114,6 +1267,417 @@ def test_warmup_phase_h_foundation_endpoints():
     assert control.status_code == 200
     assert control.json()["mode"] == "throttle"
 
+
+def test_warmup_slo_control_loop_requires_admin_authz():
+    client = TestClient(warmup_app)
+    denied = client.post(
+        "/warmup/slo/control-loop",
+        json={
+            "tenant_id": f"tenant-slo-{uuid.uuid4().hex[:6]}",
+            "mailbox": f"slo-{uuid.uuid4().hex[:6]}@gmail.com",
+            "provider": "gmail",
+            "send_success_ratio": 0.7,
+            "placement_score": 0.6,
+            "queue_latency_seconds": 180,
+        },
+    )
+    assert denied.status_code == 403
+
+
+def test_warmup_certification_in_reputation_and_current_endpoint():
+    client = TestClient(warmup_app)
+    tenant = f"tenant-cert-{uuid.uuid4().hex[:6]}"
+    mailbox = f"cert-{uuid.uuid4().hex[:6]}@gmail.com"
+    job = client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 45,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert job.status_code == 200
+
+    scored = client.post(
+        "/warmup/reputation/score",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "inbox_rate": 0.92,
+            "spam_rate": 0.01,
+            "bounce_rate": 0.01,
+            "complaint_rate": 0.001,
+            "reply_rate": 0.22,
+            "blacklist_detected": False,
+        },
+    )
+    assert scored.status_code == 200
+    assert "certification" in scored.json()
+    assert scored.json()["certification"]["tier"] in {"tier_0", "tier_1", "tier_2", "tier_3"}
+
+    current = client.get(f"/warmup/certification/current?tenant_id={tenant}&mailbox={mailbox}")
+    assert current.status_code == 200
+    body = current.json()
+    assert body["tenant_id"] == tenant
+    assert body["mailbox"] == mailbox.lower()
+    assert body["tier"] in {"tier_0", "tier_1", "tier_2", "tier_3"}
+    assert "recent_decisions" in body
+    assert isinstance(body["recent_decisions"], list)
+
+
+def test_warmup_certification_compute_and_slo_control_loop_decisions():
+    warmup_client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
+    tenant = f"tenant-slo-cert-{uuid.uuid4().hex[:6]}"
+    mailbox = f"slo-cert-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    created = warmup_client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 35,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200
+
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+    headers = gateway_signed_headers(token, request_id=f"req-cert-{uuid.uuid4().hex[:8]}")
+
+    control = warmup_client.post(
+        "/warmup/slo/control-loop",
+        headers=headers,
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "provider": "gmail",
+            "send_success_ratio": 0.72,
+            "placement_score": 0.63,
+            "queue_latency_seconds": 180,
+        },
+    )
+    assert control.status_code == 200
+    assert "certification" in control.json()
+    assert control.json()["certification"]["reason"] in {"maintained", "tier_upgraded", "tier_downgraded", "hard_fail_hold", "soft_fail_hold"}
+
+    computed = warmup_client.post(
+        "/warmup/certification/compute",
+        headers=headers,
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "source": "manual_admin",
+        },
+    )
+    assert computed.status_code == 200
+    assert computed.json()["tier"] in {"tier_0", "tier_1", "tier_2", "tier_3"}
+    assert 0.0 <= computed.json()["score"] <= 1.0
+
+    denied = warmup_client.post(
+        "/warmup/certification/compute",
+        json={"tenant_id": tenant, "mailbox": mailbox, "source": "manual_admin"},
+    )
+    assert denied.status_code in {200, 403}
+
+
+def test_warmup_certification_worker_renew_expired():
+    warmup_client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
+    tenant = f"tenant-renew-{uuid.uuid4().hex[:6]}"
+    mailbox = f"renew-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    created = warmup_client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 40,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200
+
+    scored = warmup_client.post(
+        "/warmup/reputation/score",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "inbox_rate": 0.88,
+            "spam_rate": 0.02,
+            "bounce_rate": 0.01,
+            "complaint_rate": 0.002,
+            "reply_rate": 0.2,
+            "blacklist_detected": False,
+        },
+    )
+    assert scored.status_code == 200
+
+    renew_route = next(
+        route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/worker/certification/renew"
+    )
+    warmup_state = renew_route.endpoint.__globals__
+    with warmup_state["Session"](warmup_state["engine"]) as session:
+        state = session.scalar(
+            warmup_state["select"](warmup_state["CertificationState"]).where(
+                warmup_state["CertificationState"].tenant_id == tenant,
+                warmup_state["CertificationState"].mailbox == mailbox.lower(),
+            )
+        )
+        assert state is not None
+        state.expires_at = warmup_state["utc_now"]() - warmup_state["timedelta"](days=1)
+        session.commit()
+
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    headers = gateway_signed_headers(issued.json()["access_token"], request_id=f"req-renew-{uuid.uuid4().hex[:8]}")
+
+    renewed = warmup_client.post(
+        "/warmup/worker/certification/renew",
+        headers=headers,
+        json={"limit": 50},
+    )
+    assert renewed.status_code == 200
+    assert renewed.json()["processed"] >= 1
+    assert any(item["tenant_id"] == tenant for item in renewed.json()["items"])
+
+
+def test_warmup_slo_throttle_resets_stable_windows():
+    warmup_client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
+    tenant = f"tenant-stable-reset-{uuid.uuid4().hex[:6]}"
+    mailbox = f"stable-reset-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    created = warmup_client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 50,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200
+
+    control_route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/slo/control-loop")
+    warmup_state = control_route.endpoint.__globals__
+    with warmup_state["Session"](warmup_state["engine"]) as session:
+        profile = session.scalar(
+            warmup_state["select"](warmup_state["MailboxProfile"]).where(
+                warmup_state["MailboxProfile"].tenant_id == tenant,
+                warmup_state["MailboxProfile"].mailbox == mailbox.lower(),
+            )
+        )
+        assert profile is not None
+        profile.stable_windows = 5
+        session.commit()
+
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    headers = gateway_signed_headers(issued.json()["access_token"], request_id=f"req-stable-{uuid.uuid4().hex[:8]}")
+
+    throttled = warmup_client.post(
+        "/warmup/slo/control-loop",
+        headers=headers,
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "provider": "gmail",
+            "send_success_ratio": 0.5,
+            "placement_score": 0.5,
+            "queue_latency_seconds": 240,
+        },
+    )
+    assert throttled.status_code == 200
+    assert throttled.json()["mode"] == "throttle"
+
+    with warmup_state["Session"](warmup_state["engine"]) as session:
+        profile_after = session.scalar(
+            warmup_state["select"](warmup_state["MailboxProfile"]).where(
+                warmup_state["MailboxProfile"].tenant_id == tenant,
+                warmup_state["MailboxProfile"].mailbox == mailbox.lower(),
+            )
+        )
+        assert profile_after is not None
+        assert profile_after.stable_windows == 0
+
+
+def test_warmup_slo_recovery_increments_stable_windows_and_recovers_mode():
+    warmup_client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
+    tenant = f"tenant-slo-recovery-{uuid.uuid4().hex[:6]}"
+    mailbox = f"slo-recovery-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    created = warmup_client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 50,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200
+
+    control_route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/slo/control-loop")
+    warmup_state = control_route.endpoint.__globals__
+
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    headers = gateway_signed_headers(issued.json()["access_token"], request_id=f"req-recovery-{uuid.uuid4().hex[:8]}")
+
+    throttled = warmup_client.post(
+        "/warmup/slo/control-loop",
+        headers=headers,
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "provider": "gmail",
+            "send_success_ratio": 0.55,
+            "placement_score": 0.55,
+            "queue_latency_seconds": 180,
+        },
+    )
+    assert throttled.status_code == 200
+    assert throttled.json()["mode"] == "throttle"
+
+    with warmup_state["Session"](warmup_state["engine"]) as session:
+        profile = session.scalar(
+            warmup_state["select"](warmup_state["MailboxProfile"]).where(
+                warmup_state["MailboxProfile"].tenant_id == tenant,
+                warmup_state["MailboxProfile"].mailbox == mailbox.lower(),
+            )
+        )
+        assert profile is not None
+        assert profile.stable_windows == 0
+
+    for expected in [1, 2]:
+        healthy = warmup_client.post(
+            "/warmup/slo/control-loop",
+            headers=headers,
+            json={
+                "tenant_id": tenant,
+                "mailbox": mailbox,
+                "provider": "gmail",
+                "send_success_ratio": 0.98,
+                "placement_score": 0.9,
+                "queue_latency_seconds": 30,
+            },
+        )
+        assert healthy.status_code == 200
+        assert healthy.json()["mode"] in {"throttle", "normal"}
+        with warmup_state["Session"](warmup_state["engine"]) as session:
+            profile = session.scalar(
+                warmup_state["select"](warmup_state["MailboxProfile"]).where(
+                    warmup_state["MailboxProfile"].tenant_id == tenant,
+                    warmup_state["MailboxProfile"].mailbox == mailbox.lower(),
+                )
+            )
+            assert profile is not None
+            assert profile.stable_windows == expected
+
+    recovered = warmup_client.post(
+        "/warmup/slo/control-loop",
+        headers=headers,
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "provider": "gmail",
+            "send_success_ratio": 0.99,
+            "placement_score": 0.93,
+            "queue_latency_seconds": 20,
+        },
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["mode"] == "normal"
+    with warmup_state["Session"](warmup_state["engine"]) as session:
+        profile = session.scalar(
+            warmup_state["select"](warmup_state["MailboxProfile"]).where(
+                warmup_state["MailboxProfile"].tenant_id == tenant,
+                warmup_state["MailboxProfile"].mailbox == mailbox.lower(),
+            )
+        )
+        assert profile is not None
+        assert profile.stable_windows >= 3
+
+
+def test_warmup_queue_retry_backoff_respects_ready_time():
+    client = TestClient(warmup_app)
+    route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/worker/process-next")
+    warmup_state = route.endpoint.__globals__
+    warmup_state["IN_MEMORY_QUEUES"]["send_execution"].clear()
+    warmup_state["IN_MEMORY_INFLIGHT"].clear()
+    warmup_state["DEAD_LETTER_QUEUE"].clear()
+    idem = f"backoff-{uuid.uuid4().hex[:16]}"
+    enqueued = client.post(
+        "/warmup/worker/enqueue",
+        json={
+            "tenant_id": "tenant-backoff",
+            "mailbox": "backoff@example.com",
+            "queue_name": "send_execution",
+            "idempotency_key": idem,
+            "payload": {"force_fail": True},
+            "max_attempts": 2,
+        },
+    )
+    assert enqueued.status_code == 200
+
+    first = client.post("/warmup/worker/process-next", params={"queue_name": "send_execution"})
+    assert first.status_code == 200
+    assert first.json().get("retry_scheduled") is True
+
+    immediate = client.post("/warmup/worker/process-next", params={"queue_name": "send_execution"})
+    assert immediate.status_code == 200
+    assert immediate.json().get("ready") is False
+    assert immediate.json().get("processed") == 0
+
+    queue = warmup_state["IN_MEMORY_QUEUES"]["send_execution"]
+    assert len(queue) >= 1
+    queue[0]["next_attempt_at"] = warmup_state["time"].time() - 1
+
+    retried = client.post("/warmup/worker/process-next", params={"queue_name": "send_execution"})
+    assert retried.status_code == 200
+    assert retried.json().get("dead_lettered") is True
 
 def test_billing_service_phase_g_lifecycle_endpoints():
     billing_src = (ROOT / "billing-service/src/index.js").read_text(encoding="utf-8")
