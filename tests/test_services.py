@@ -1092,6 +1092,7 @@ def test_end_to_end_auth_lead_warmup_and_admin_flow():
 
 def test_warmup_phase_h_foundation_endpoints():
     client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
     tenant = f"tenant-h-{uuid.uuid4().hex[:6]}"
     mailbox = f"h-{uuid.uuid4().hex[:6]}@gmail.com"
 
@@ -1129,8 +1130,21 @@ def test_warmup_phase_h_foundation_endpoints():
     assert fingerprint.status_code == 200
     assert len(fingerprint.json()["fingerprint"]) == 64
 
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+
     control = client.post(
         "/warmup/slo/control-loop",
+        headers=gateway_signed_headers(token, request_id=f"req-{uuid.uuid4().hex[:12]}"),
         json={
             "tenant_id": tenant,
             "mailbox": mailbox,
@@ -1143,6 +1157,60 @@ def test_warmup_phase_h_foundation_endpoints():
     assert control.status_code == 200
     assert control.json()["mode"] == "throttle"
 
+
+def test_warmup_slo_control_loop_requires_admin_authz():
+    client = TestClient(warmup_app)
+    denied = client.post(
+        "/warmup/slo/control-loop",
+        json={
+            "tenant_id": f"tenant-slo-{uuid.uuid4().hex[:6]}",
+            "mailbox": f"slo-{uuid.uuid4().hex[:6]}@gmail.com",
+            "provider": "gmail",
+            "send_success_ratio": 0.7,
+            "placement_score": 0.6,
+            "queue_latency_seconds": 180,
+        },
+    )
+    assert denied.status_code == 403
+
+
+def test_warmup_queue_retry_backoff_respects_ready_time():
+    client = TestClient(warmup_app)
+    route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/worker/process-next")
+    warmup_state = route.endpoint.__globals__
+    warmup_state["IN_MEMORY_QUEUES"]["send_execution"].clear()
+    warmup_state["IN_MEMORY_INFLIGHT"].clear()
+    warmup_state["DEAD_LETTER_QUEUE"].clear()
+    idem = f"backoff-{uuid.uuid4().hex[:16]}"
+    enqueued = client.post(
+        "/warmup/worker/enqueue",
+        json={
+            "tenant_id": "tenant-backoff",
+            "mailbox": "backoff@example.com",
+            "queue_name": "send_execution",
+            "idempotency_key": idem,
+            "payload": {"force_fail": True},
+            "max_attempts": 2,
+        },
+    )
+    assert enqueued.status_code == 200
+
+    first = client.post("/warmup/worker/process-next", params={"queue_name": "send_execution"})
+    assert first.status_code == 200
+    assert first.json().get("retry_scheduled") is True
+
+    immediate = client.post("/warmup/worker/process-next", params={"queue_name": "send_execution"})
+    assert immediate.status_code == 200
+    assert immediate.json().get("ready") is False
+    assert immediate.json().get("processed") == 0
+
+    queue = warmup_state["IN_MEMORY_QUEUES"]["send_execution"]
+    assert len(queue) >= 1
+    queue[0]["next_attempt_at"] = warmup_state["time"].time() - 1
+
+    retried = client.post("/warmup/worker/process-next", params={"queue_name": "send_execution"})
+    assert retried.status_code == 200
+    assert retried.json().get("dead_lettered") is True
 
 def test_billing_service_phase_g_lifecycle_endpoints():
     billing_src = (ROOT / "billing-service/src/index.js").read_text(encoding="utf-8")

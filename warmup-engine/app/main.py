@@ -86,6 +86,15 @@ SECRETS_MANAGER_URL = os.getenv("SECRETS_MANAGER_URL", "").rstrip("/")
 SECRETS_MANAGER_TOKEN = os.getenv("SECRETS_MANAGER_TOKEN", "")
 ADMIN_RATE_LIMIT_PER_MINUTE = int(os.getenv("WARMUP_ADMIN_RATE_LIMIT_PER_MINUTE", "30"))
 AUDIT_LOG_RETENTION_DAYS = int(os.getenv("AUDIT_LOG_RETENTION_DAYS", "90"))
+SLO_THROTTLE_SEND_SUCCESS_THRESHOLD = float(os.getenv("SLO_THROTTLE_SEND_SUCCESS_THRESHOLD", "0.9"))
+SLO_THROTTLE_PLACEMENT_THRESHOLD = float(os.getenv("SLO_THROTTLE_PLACEMENT_THRESHOLD", "0.7"))
+SLO_THROTTLE_QUEUE_LATENCY_THRESHOLD_SECONDS = float(os.getenv("SLO_THROTTLE_QUEUE_LATENCY_THRESHOLD_SECONDS", "120"))
+SLO_RECOVERY_SEND_SUCCESS_THRESHOLD = float(os.getenv("SLO_RECOVERY_SEND_SUCCESS_THRESHOLD", "0.95"))
+SLO_RECOVERY_PLACEMENT_THRESHOLD = float(os.getenv("SLO_RECOVERY_PLACEMENT_THRESHOLD", "0.8"))
+SLO_RECOVERY_QUEUE_LATENCY_THRESHOLD_SECONDS = float(os.getenv("SLO_RECOVERY_QUEUE_LATENCY_THRESHOLD_SECONDS", "90"))
+SLO_RECOVERY_STABLE_WINDOWS = int(os.getenv("SLO_RECOVERY_STABLE_WINDOWS", "3"))
+SLO_THROTTLE_DECREASE_PCT = float(os.getenv("SLO_THROTTLE_DECREASE_PCT", "0.15"))
+SLO_RECOVERY_INCREASE_PCT = float(os.getenv("SLO_RECOVERY_INCREASE_PCT", "0.1"))
 WARMUP_SCHEMA_VERSION = "2026-03-31-warmup-v1"
 _ADMIN_RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 _ADMIN_RATE_LOCK = Lock()
@@ -1216,6 +1225,23 @@ def _event_key(queue_name: str, event_id: Any) -> str:
     return f"{queue_name}:{event_id}"
 
 
+def dequeue_ready_task(queue_name: str) -> dict[str, Any] | None:
+    queue = IN_MEMORY_QUEUES[queue_name]
+    if not queue:
+        return None
+    now_ts = time.time()
+    queue_length = len(queue)
+    for _ in range(queue_length):
+        task = queue.popleft()
+        next_attempt_at = task.get("next_attempt_at")
+        if isinstance(next_attempt_at, (int, float)) and next_attempt_at > now_ts:
+            queue.append(task)
+            continue
+        task.pop("next_attempt_at", None)
+        return task
+    return None
+
+
 def sweep_stuck_inflight_tasks() -> dict[str, int]:
     now = utc_now()
     moved = 0
@@ -1260,6 +1286,7 @@ def sweep_stuck_inflight_tasks() -> dict[str, int]:
             else:
                 task["attempt"] = attempts + 1
                 task["retry_backoff_seconds"] = min(60, 2 ** attempts)
+                task["next_attempt_at"] = time.time() + task["retry_backoff_seconds"]
                 IN_MEMORY_QUEUES[queue_name].append(task)
                 event.retry_count += 1
                 event.status = "retrying"
@@ -1626,7 +1653,10 @@ def process_next(queue_name: str = "send_execution") -> dict:
         refresh_queue_backlog_metrics()
         return {"processed": 0, "backend": "in-memory"}
 
-    task = IN_MEMORY_QUEUES[queue_name].popleft()
+    task = dequeue_ready_task(queue_name)
+    if task is None:
+        refresh_queue_backlog_metrics()
+        return {"processed": 0, "backend": "in-memory", "ready": False}
     lease_until = utc_now() + timedelta(seconds=QUEUE_VISIBILITY_TIMEOUT_SECONDS)
     inflight_key = _event_key(queue_name, task.get("event_id"))
     IN_MEMORY_INFLIGHT[inflight_key] = {"task": dict(task), "queue_name": queue_name, "lease_until": lease_until}
@@ -1681,7 +1711,8 @@ def process_next(queue_name: str = "send_execution") -> dict:
 
             event.status = "retrying"
             task["attempt"] = attempts + 1
-            task["retry_backoff_seconds"] = 2 ** attempts
+            task["retry_backoff_seconds"] = min(60, 2 ** attempts)
+            task["next_attempt_at"] = time.time() + task["retry_backoff_seconds"]
             IN_MEMORY_QUEUES[queue_name].append(task)
             session.execute(delete(WorkerLease).where(WorkerLease.event_id == event.id, WorkerLease.queue_name == queue_name))
             session.commit()
@@ -2080,22 +2111,65 @@ def content_fingerprint(payload: ContentFingerprintRequest, request: Request) ->
 
 
 @app.post("/warmup/slo/control-loop")
-def slo_control_loop(payload: SloControlLoopRequest, request: Request) -> dict:
+def slo_control_loop(
+    payload: SloControlLoopRequest,
+    request: Request,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> dict:
     mailbox = payload.mailbox.lower()
     provider = payload.provider.lower()
+    if not authorization and not x_admin_api_key:
+        raise HTTPException(status_code=403, detail="Admin credentials required")
+    require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        tenant_scope=payload.tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
     with Session(engine) as session:
         profile = get_or_create_profile(session, payload.tenant_id, mailbox)
         throttled = (
-            payload.send_success_ratio < 0.9
-            or payload.placement_score < 0.7
-            or payload.queue_latency_seconds > 120
+            payload.send_success_ratio < SLO_THROTTLE_SEND_SUCCESS_THRESHOLD
+            or payload.placement_score < SLO_THROTTLE_PLACEMENT_THRESHOLD
+            or payload.queue_latency_seconds > SLO_THROTTLE_QUEUE_LATENCY_THRESHOLD_SECONDS
         )
         if throttled:
+            profile.stable_windows = 0
             profile.mode = "throttle"
-            profile.current_daily_target = max(1, int(profile.current_daily_target * 0.8))
-        elif profile.mode == "throttle" and payload.send_success_ratio >= 0.95 and payload.placement_score >= 0.8:
-            profile.mode = "normal"
-            profile.current_daily_target = min(MAX_MAILBOX_DAILY_CAP, profile.current_daily_target + 5)
+            current_target = max(1, profile.current_daily_target)
+            decrease_pct = clamp(SLO_THROTTLE_DECREASE_PCT, 0.01, 0.5)
+            decrease = max(1, int(math.ceil(current_target * decrease_pct)))
+            profile.current_daily_target = max(1, profile.current_daily_target - decrease)
+        else:
+            healthy = (
+                payload.send_success_ratio >= SLO_RECOVERY_SEND_SUCCESS_THRESHOLD
+                and payload.placement_score >= SLO_RECOVERY_PLACEMENT_THRESHOLD
+                and payload.queue_latency_seconds <= SLO_RECOVERY_QUEUE_LATENCY_THRESHOLD_SECONDS
+            )
+            if healthy:
+                profile.stable_windows += 1
+                if profile.mode == "throttle" and profile.stable_windows >= max(1, SLO_RECOVERY_STABLE_WINDOWS):
+                    profile.mode = "normal"
+                if profile.mode == "normal":
+                    current_target = max(1, profile.current_daily_target)
+                    increase_pct = clamp(SLO_RECOVERY_INCREASE_PCT, 0.01, 0.3)
+                    increase = max(1, int(math.ceil(current_target * increase_pct)))
+                    profile.current_daily_target = min(MAX_MAILBOX_DAILY_CAP, profile.current_daily_target + increase)
+            else:
+                profile.stable_windows = 0
         profile.updated_at = utc_now()
         session.commit()
         target = profile.current_daily_target
