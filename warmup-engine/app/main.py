@@ -100,7 +100,14 @@ SLO_RECOVERY_QUEUE_LATENCY_THRESHOLD_SECONDS = float(os.getenv("SLO_RECOVERY_QUE
 SLO_RECOVERY_STABLE_WINDOWS = int(os.getenv("SLO_RECOVERY_STABLE_WINDOWS", "3"))
 SLO_THROTTLE_DECREASE_PCT = float(os.getenv("SLO_THROTTLE_DECREASE_PCT", "0.15"))
 SLO_RECOVERY_INCREASE_PCT = float(os.getenv("SLO_RECOVERY_INCREASE_PCT", "0.1"))
-WARMUP_SCHEMA_VERSION = "2026-03-31-warmup-v1"
+CERTIFICATION_GLOBAL_BENCHMARK_MIN_SCORE = float(os.getenv("CERTIFICATION_GLOBAL_BENCHMARK_MIN_SCORE", "0.9"))
+CERTIFICATION_TIER_EXPIRY_DAYS = {
+    "tier_0": int(os.getenv("CERTIFICATION_TIER_0_EXPIRY_DAYS", "7")),
+    "tier_1": int(os.getenv("CERTIFICATION_TIER_1_EXPIRY_DAYS", "14")),
+    "tier_2": int(os.getenv("CERTIFICATION_TIER_2_EXPIRY_DAYS", "21")),
+    "tier_3": int(os.getenv("CERTIFICATION_TIER_3_EXPIRY_DAYS", "30")),
+}
+WARMUP_SCHEMA_VERSION = "2026-04-02-warmup-certification-v1"
 _ADMIN_RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 _ADMIN_RATE_LOCK = Lock()
 
@@ -477,6 +484,58 @@ class ApprovalRequest(Base):
     )
 
 
+class CertificationState(Base):
+    __tablename__ = "certification_states"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    provider: Mapped[str] = mapped_column(String(120), index=True, default="")
+    tier: Mapped[str] = mapped_column(String(32), default="tier_0", index=True)
+    certification_score: Mapped[float] = mapped_column(Float, default=0.0)
+    global_benchmark_qualified: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    hard_fail_streak_days: Mapped[int] = mapped_column(Integer, default=0)
+    decision_reason: Mapped[str] = mapped_column(String(255), default="initialized")
+    score_breakdown: Mapped[str] = mapped_column(String, default="{}")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_certification_states_tenant_mailbox", "tenant_id", "mailbox", unique=True),
+        Index("ix_certification_states_expires", "expires_at"),
+    )
+
+
+class CertificationDecisionRecord(Base):
+    __tablename__ = "certification_decision_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), index=True)
+    mailbox: Mapped[str] = mapped_column(String(320), index=True)
+    provider: Mapped[str] = mapped_column(String(120), default="")
+    source: Mapped[str] = mapped_column(String(64), index=True, default="unknown")
+    mode: Mapped[str] = mapped_column(String(32), default="normal")
+    previous_tier: Mapped[str] = mapped_column(String(32), default="tier_0")
+    decided_tier: Mapped[str] = mapped_column(String(32), default="tier_0")
+    certification_score: Mapped[float] = mapped_column(Float, default=0.0)
+    hard_fail: Mapped[bool] = mapped_column(Boolean, default=False)
+    soft_fail: Mapped[bool] = mapped_column(Boolean, default=False)
+    global_benchmark_qualified: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason_code: Mapped[str] = mapped_column(String(120), default="decision_recorded")
+    detail_json: Mapped[str] = mapped_column(String, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+    __table_args__ = (
+        Index("ix_cert_decisions_tenant_mailbox_created", "tenant_id", "mailbox", "created_at"),
+        Index("ix_cert_decisions_source_created", "source", "created_at"),
+    )
+
+
 Base.metadata.create_all(engine)
 with engine.begin() as conn:
     conn.exec_driver_sql(
@@ -637,6 +696,16 @@ class ApprovalRequestCreate(BaseModel):
 
 class ApprovalDecisionRequest(BaseModel):
     approval_request_id: int = Field(ge=1)
+
+
+class CertificationComputeRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=64)
+    mailbox: str
+    source: Literal["manual_admin", "worker_renewal", "reputation_score", "slo_control_loop"] = "manual_admin"
+
+
+class CertificationRenewalRequest(BaseModel):
+    limit: int = Field(default=100, ge=1, le=500)
 
 
 def provider_profile_for_mailbox(mailbox: str) -> dict[str, float]:
@@ -1153,6 +1222,211 @@ def quality_score(profile: MailboxProfile) -> float:
     )
 
 
+def certification_tier_rank(tier: str) -> int:
+    return {"tier_0": 0, "tier_1": 1, "tier_2": 2, "tier_3": 3}.get(tier, 0)
+
+
+def tier_from_score(score: float, hard_fail: bool) -> str:
+    if hard_fail:
+        return "tier_0"
+    if score >= 0.9:
+        return "tier_3"
+    if score >= 0.8:
+        return "tier_2"
+    if score >= 0.7:
+        return "tier_1"
+    return "tier_0"
+
+
+def certification_expiry_for_tier(tier: str) -> datetime:
+    days = CERTIFICATION_TIER_EXPIRY_DAYS.get(tier, 7)
+    return utc_now() + timedelta(days=max(1, days))
+
+
+def compute_certification_components(
+    profile: MailboxProfile,
+    *,
+    placement_score: float | None = None,
+    send_success_ratio: float | None = None,
+    queue_latency_seconds: float | None = None,
+) -> tuple[float, dict[str, float], bool, bool]:
+    placement = clamp(placement_score if placement_score is not None else profile.inbox_ewma, 0.0, 1.0)
+    send_success = clamp(
+        send_success_ratio
+        if send_success_ratio is not None
+        else clamp(1.0 - (profile.bounce_ewma + profile.complaint_ewma + profile.spam_ewma), 0.0, 1.0),
+        0.0,
+        1.0,
+    )
+    latency_score = 1.0
+    if queue_latency_seconds is not None:
+        latency_score = clamp(1.0 - (queue_latency_seconds / max(1.0, SLO_THROTTLE_QUEUE_LATENCY_THRESHOLD_SECONDS * 2)), 0.0, 1.0)
+    risk_inverse = clamp(1.0 - profile.risk_score, 0.0, 1.0)
+    quality = quality_score(profile)
+
+    hard_fail = (
+        profile.mode in {"quarantine", "paused"}
+        or profile.spam_ewma >= 0.25
+        or profile.bounce_ewma >= 0.18
+        or profile.complaint_ewma >= 0.08
+    )
+    soft_fail = (
+        profile.mode == "throttle"
+        or profile.spam_ewma >= 0.12
+        or profile.bounce_ewma >= 0.09
+        or profile.complaint_ewma >= 0.03
+    )
+
+    weighted_score = (
+        placement * 0.28
+        + send_success * 0.22
+        + quality * 0.2
+        + risk_inverse * 0.2
+        + latency_score * 0.1
+    )
+    if soft_fail:
+        weighted_score -= 0.08
+    if hard_fail:
+        weighted_score -= 0.18
+    weighted_score = clamp(weighted_score, 0.0, 1.0)
+    breakdown = {
+        "placement_score": round(placement, 4),
+        "send_success_ratio": round(send_success, 4),
+        "quality_score": round(quality, 4),
+        "risk_inverse": round(risk_inverse, 4),
+        "latency_score": round(latency_score, 4),
+    }
+    return weighted_score, breakdown, hard_fail, soft_fail
+
+
+def get_or_create_certification_state(session: Session, tenant_id: str, mailbox: str) -> CertificationState:
+    normalized_mailbox = mailbox.lower()
+    state = session.scalar(
+        select(CertificationState).where(
+            CertificationState.tenant_id == tenant_id,
+            CertificationState.mailbox == normalized_mailbox,
+        )
+    )
+    if state:
+        return state
+    provider = provider_from_mailbox(normalized_mailbox)
+    state = CertificationState(
+        tenant_id=tenant_id,
+        mailbox=normalized_mailbox,
+        provider=provider,
+        tier="tier_0",
+        certification_score=0.0,
+        global_benchmark_qualified=False,
+        hard_fail_streak_days=0,
+        decision_reason="initialized",
+        score_breakdown=json.dumps({}),
+        expires_at=certification_expiry_for_tier("tier_0"),
+    )
+    session.add(state)
+    session.flush()
+    return state
+
+
+def update_certification_and_record_decision(
+    session: Session,
+    *,
+    profile: MailboxProfile,
+    source: str,
+    placement_score: float | None = None,
+    send_success_ratio: float | None = None,
+    queue_latency_seconds: float | None = None,
+    actor: str = "system",
+    correlation_id: str | None = None,
+) -> CertificationState:
+    state = get_or_create_certification_state(session, profile.tenant_id, profile.mailbox)
+    previous_tier = state.tier
+    score, breakdown, hard_fail, soft_fail = compute_certification_components(
+        profile,
+        placement_score=placement_score,
+        send_success_ratio=send_success_ratio,
+        queue_latency_seconds=queue_latency_seconds,
+    )
+    proposed_tier = tier_from_score(score, hard_fail)
+    if certification_tier_rank(proposed_tier) > certification_tier_rank(previous_tier):
+        next_tier = proposed_tier
+    elif certification_tier_rank(proposed_tier) < certification_tier_rank(previous_tier):
+        next_tier = proposed_tier
+    else:
+        next_tier = previous_tier
+
+    hard_fail_streak_days = state.hard_fail_streak_days + 1 if hard_fail else 0
+    global_benchmark_qualified = (
+        next_tier == "tier_3"
+        and score >= CERTIFICATION_GLOBAL_BENCHMARK_MIN_SCORE
+        and hard_fail_streak_days == 0
+    )
+    reason_code = "maintained"
+    if certification_tier_rank(next_tier) > certification_tier_rank(previous_tier):
+        reason_code = "tier_upgraded"
+    elif certification_tier_rank(next_tier) < certification_tier_rank(previous_tier):
+        reason_code = "tier_downgraded"
+    elif hard_fail:
+        reason_code = "hard_fail_hold"
+    elif soft_fail:
+        reason_code = "soft_fail_hold"
+
+    state.provider = provider_from_mailbox(profile.mailbox)
+    state.tier = next_tier
+    state.certification_score = round(score, 4)
+    state.global_benchmark_qualified = global_benchmark_qualified
+    state.hard_fail_streak_days = hard_fail_streak_days
+    state.decision_reason = reason_code
+    state.score_breakdown = json.dumps(breakdown)
+    state.expires_at = certification_expiry_for_tier(next_tier)
+    state.updated_at = utc_now()
+
+    session.add(
+        CertificationDecisionRecord(
+            tenant_id=profile.tenant_id,
+            mailbox=profile.mailbox,
+            provider=state.provider,
+            source=source,
+            mode=profile.mode,
+            previous_tier=previous_tier,
+            decided_tier=next_tier,
+            certification_score=round(score, 4),
+            hard_fail=hard_fail,
+            soft_fail=soft_fail,
+            global_benchmark_qualified=global_benchmark_qualified,
+            reason_code=reason_code,
+            detail_json=json.dumps(
+                {
+                    "breakdown": breakdown,
+                    "send_success_ratio": send_success_ratio,
+                    "placement_score": placement_score,
+                    "queue_latency_seconds": queue_latency_seconds,
+                }
+            ),
+        )
+    )
+    write_admin_audit_log(
+        session,
+        actor=actor,
+        action="certification_decision",
+        resource_type="mailbox_certification",
+        resource_id=f"{profile.tenant_id}:{profile.mailbox}",
+        details={
+            "tenant_id": profile.tenant_id,
+            "mailbox": profile.mailbox,
+            "source": source,
+            "previous_tier": previous_tier,
+            "decided_tier": next_tier,
+            "certification_score": round(score, 4),
+            "hard_fail": hard_fail,
+            "soft_fail": soft_fail,
+            "global_benchmark_qualified": global_benchmark_qualified,
+            "reason_code": reason_code,
+        },
+        correlation_id=correlation_id,
+    )
+    return state
+
+
 def apply_adaptive_policy(profile: MailboxProfile, risk: float, blacklist_detected: bool) -> tuple[int, str]:
     profile_cfg = provider_profile_for_mailbox(profile.mailbox)
     kp, ki, kd = profile_cfg["kp"], profile_cfg["ki"], profile_cfg["kd"]
@@ -1536,6 +1810,11 @@ def update_reputation(payload: ReputationUpdateRequest) -> dict:
                 ),
             )
         )
+        certification = update_certification_and_record_decision(
+            session,
+            profile=profile,
+            source="reputation_score",
+        )
         session.commit()
 
         METRICS["reputation_updates"] += 1
@@ -1554,6 +1833,12 @@ def update_reputation(payload: ReputationUpdateRequest) -> dict:
             "reputation_score": round(profile.reputation_score, 4),
             "daily_target": profile.current_daily_target,
             "mode": mode,
+            "certification": {
+                "tier": certification.tier,
+                "score": round(certification.certification_score, 4),
+                "global_benchmark_qualified": certification.global_benchmark_qualified,
+                "expires_at": certification.expires_at.isoformat(),
+            },
         }
 
 
@@ -2172,6 +2457,14 @@ def slo_control_loop(
         x_gateway_signed_at=x_gateway_signed_at,
         x_gateway_signature=x_gateway_signature,
     )
+    correlation_id = getattr(request.state, "request_id", None) or x_request_id
+    actor = "system"
+    if authorization:
+        try:
+            actor_claims = extract_token_claims(authorization)
+            actor = str(actor_claims.get("sub") or actor)
+        except Exception:
+            actor = "system"
     with Session(engine) as session:
         profile = get_or_create_profile(session, payload.tenant_id, mailbox)
         throttled = (
@@ -2204,9 +2497,26 @@ def slo_control_loop(
             else:
                 profile.stable_windows = 0
         profile.updated_at = utc_now()
+        certification = update_certification_and_record_decision(
+            session,
+            profile=profile,
+            source="slo_control_loop",
+            placement_score=payload.placement_score,
+            send_success_ratio=payload.send_success_ratio,
+            queue_latency_seconds=payload.queue_latency_seconds,
+            actor=actor,
+            correlation_id=correlation_id,
+        )
         session.commit()
         target = profile.current_daily_target
         mode = profile.mode
+        certification_payload = {
+            "tier": certification.tier,
+            "score": round(certification.certification_score, 4),
+            "global_benchmark_qualified": certification.global_benchmark_qualified,
+            "reason": certification.decision_reason,
+            "expires_at": certification.expires_at.isoformat(),
+        }
     json_log(
         "slo_control_loop_applied",
         tenant_id=payload.tenant_id,
@@ -2222,6 +2532,7 @@ def slo_control_loop(
         "provider": provider,
         "mode": mode,
         "daily_target": target,
+        "certification": certification_payload,
     }
 
 
@@ -2713,3 +3024,187 @@ def enforce_admin_audit_retention(
             session.execute(delete(AdminAuditLog).where(AdminAuditLog.id.in_(ids)))
             session.commit()
     return {"deleted": deleted, "dry_run": dry_run, "retention_days": AUDIT_LOG_RETENTION_DAYS}
+
+
+@app.post("/warmup/certification/compute")
+def compute_mailbox_certification(
+    payload: CertificationComputeRequest,
+    request: Request,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        tenant_scope=payload.tenant_id,
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
+    actor = claims.get("sub") if claims else "system"
+    correlation_id = getattr(request.state, "request_id", None) or x_request_id
+    mailbox = payload.mailbox.lower()
+    with Session(engine) as session:
+        profile = get_or_create_profile(session, payload.tenant_id, mailbox)
+        state = update_certification_and_record_decision(
+            session,
+            profile=profile,
+            source=payload.source,
+            actor=actor,
+            correlation_id=correlation_id,
+        )
+        session.commit()
+        breakdown = json.loads(state.score_breakdown or "{}")
+    return {
+        "tenant_id": payload.tenant_id,
+        "mailbox": mailbox,
+        "tier": state.tier,
+        "score": round(state.certification_score, 4),
+        "global_benchmark_qualified": state.global_benchmark_qualified,
+        "hard_fail_streak_days": state.hard_fail_streak_days,
+        "reason": state.decision_reason,
+        "expires_at": state.expires_at.isoformat(),
+        "breakdown": breakdown,
+    }
+
+
+@app.get("/warmup/certification/current")
+def get_current_certification(tenant_id: str, mailbox: str) -> dict:
+    mailbox_normalized = mailbox.lower()
+    with Session(engine) as session:
+        state = session.scalar(
+            select(CertificationState).where(
+                CertificationState.tenant_id == tenant_id,
+                CertificationState.mailbox == mailbox_normalized,
+            )
+        )
+        if not state:
+            profile = get_or_create_profile(session, tenant_id, mailbox_normalized)
+            state = get_or_create_certification_state(session, tenant_id, mailbox_normalized)
+            state = update_certification_and_record_decision(
+                session,
+                profile=profile,
+                source="manual_admin",
+                actor="system",
+                correlation_id=None,
+            )
+            session.commit()
+        recent = list(
+            session.scalars(
+                select(CertificationDecisionRecord)
+                .where(
+                    CertificationDecisionRecord.tenant_id == tenant_id,
+                    CertificationDecisionRecord.mailbox == mailbox_normalized,
+                )
+                .order_by(CertificationDecisionRecord.created_at.desc())
+                .limit(5)
+            )
+        )
+    return {
+        "tenant_id": tenant_id,
+        "mailbox": mailbox_normalized,
+        "tier": state.tier,
+        "score": round(state.certification_score, 4),
+        "global_benchmark_qualified": state.global_benchmark_qualified,
+        "hard_fail_streak_days": state.hard_fail_streak_days,
+        "reason": state.decision_reason,
+        "expires_at": state.expires_at.isoformat(),
+        "breakdown": json.loads(state.score_breakdown or "{}"),
+        "recent_decisions": [
+            {
+                "id": row.id,
+                "source": row.source,
+                "mode": row.mode,
+                "previous_tier": row.previous_tier,
+                "decided_tier": row.decided_tier,
+                "certification_score": round(row.certification_score, 4),
+                "hard_fail": row.hard_fail,
+                "soft_fail": row.soft_fail,
+                "global_benchmark_qualified": row.global_benchmark_qualified,
+                "reason_code": row.reason_code,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in recent
+        ],
+    }
+
+
+@app.post("/warmup/worker/certification/renew")
+def renew_expired_certifications(
+    payload: CertificationRenewalRequest,
+    request: Request,
+    x_admin_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_caller_service: str | None = Header(default=None),
+    x_caller_identity: str | None = Header(default=None),
+    x_target_service: str | None = Header(default=None),
+    x_request_id: str | None = Header(default=None),
+    x_gateway_signed_at: str | None = Header(default=None),
+    x_gateway_signature: str | None = Header(default=None),
+) -> dict:
+    claims = require_admin(
+        x_admin_api_key,
+        authorization,
+        permission="warmup:admin",
+        x_caller_service=x_caller_service,
+        x_caller_identity=x_caller_identity,
+        x_target_service=x_target_service,
+        x_request_id=x_request_id,
+        x_gateway_signed_at=x_gateway_signed_at,
+        x_gateway_signature=x_gateway_signature,
+    )
+    actor = claims.get("sub") if claims else "system"
+    correlation_id = getattr(request.state, "request_id", None) or x_request_id
+    processed = 0
+    renewed: list[dict[str, Any]] = []
+    now = utc_now()
+    with Session(engine) as session:
+        states = list(
+            session.scalars(
+                select(CertificationState)
+                .where(CertificationState.expires_at <= now)
+                .order_by(CertificationState.expires_at.asc())
+                .limit(payload.limit)
+            )
+        )
+        for state in states:
+            profile = get_or_create_profile(session, state.tenant_id, state.mailbox)
+            refreshed = update_certification_and_record_decision(
+                session,
+                profile=profile,
+                source="worker_renewal",
+                actor=actor,
+                correlation_id=correlation_id,
+            )
+            processed += 1
+            renewed.append(
+                {
+                    "tenant_id": refreshed.tenant_id,
+                    "mailbox": refreshed.mailbox,
+                    "tier": refreshed.tier,
+                    "score": round(refreshed.certification_score, 4),
+                    "expires_at": refreshed.expires_at.isoformat(),
+                }
+            )
+        if processed:
+            write_admin_audit_log(
+                session,
+                actor=actor,
+                action="certification_renewal_batch",
+                resource_type="mailbox_certification",
+                resource_id="batch",
+                details={"processed": processed},
+                correlation_id=correlation_id,
+            )
+        session.commit()
+    return {"processed": processed, "items": renewed}

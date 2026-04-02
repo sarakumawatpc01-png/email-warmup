@@ -1284,6 +1284,186 @@ def test_warmup_slo_control_loop_requires_admin_authz():
     assert denied.status_code == 403
 
 
+def test_warmup_certification_in_reputation_and_current_endpoint():
+    client = TestClient(warmup_app)
+    tenant = f"tenant-cert-{uuid.uuid4().hex[:6]}"
+    mailbox = f"cert-{uuid.uuid4().hex[:6]}@gmail.com"
+    job = client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 45,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert job.status_code == 200
+
+    scored = client.post(
+        "/warmup/reputation/score",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "inbox_rate": 0.92,
+            "spam_rate": 0.01,
+            "bounce_rate": 0.01,
+            "complaint_rate": 0.001,
+            "reply_rate": 0.22,
+            "blacklist_detected": False,
+        },
+    )
+    assert scored.status_code == 200
+    assert "certification" in scored.json()
+    assert scored.json()["certification"]["tier"] in {"tier_0", "tier_1", "tier_2", "tier_3"}
+
+    current = client.get(f"/warmup/certification/current?tenant_id={tenant}&mailbox={mailbox}")
+    assert current.status_code == 200
+    body = current.json()
+    assert body["tenant_id"] == tenant
+    assert body["mailbox"] == mailbox.lower()
+    assert body["tier"] in {"tier_0", "tier_1", "tier_2", "tier_3"}
+    assert "recent_decisions" in body
+    assert isinstance(body["recent_decisions"], list)
+
+
+def test_warmup_certification_compute_and_slo_control_loop_decisions():
+    warmup_client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
+    tenant = f"tenant-slo-cert-{uuid.uuid4().hex[:6]}"
+    mailbox = f"slo-cert-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    created = warmup_client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 35,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200
+
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    token = issued.json()["access_token"]
+    headers = gateway_signed_headers(token, request_id=f"req-cert-{uuid.uuid4().hex[:8]}")
+
+    control = warmup_client.post(
+        "/warmup/slo/control-loop",
+        headers=headers,
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "provider": "gmail",
+            "send_success_ratio": 0.72,
+            "placement_score": 0.63,
+            "queue_latency_seconds": 180,
+        },
+    )
+    assert control.status_code == 200
+    assert "certification" in control.json()
+    assert control.json()["certification"]["reason"] in {"maintained", "tier_upgraded", "tier_downgraded", "hard_fail_hold", "soft_fail_hold"}
+
+    computed = warmup_client.post(
+        "/warmup/certification/compute",
+        headers=headers,
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "source": "manual_admin",
+        },
+    )
+    assert computed.status_code == 200
+    assert computed.json()["tier"] in {"tier_0", "tier_1", "tier_2", "tier_3"}
+    assert 0.0 <= computed.json()["score"] <= 1.0
+
+    denied = warmup_client.post(
+        "/warmup/certification/compute",
+        json={"tenant_id": tenant, "mailbox": mailbox, "source": "manual_admin"},
+    )
+    assert denied.status_code in {200, 403}
+
+
+def test_warmup_certification_worker_renew_expired():
+    warmup_client = TestClient(warmup_app)
+    auth_client = TestClient(auth_app)
+    tenant = f"tenant-renew-{uuid.uuid4().hex[:6]}"
+    mailbox = f"renew-{uuid.uuid4().hex[:6]}@gmail.com"
+
+    created = warmup_client.post(
+        "/warmup/jobs",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "domain_age_days": 40,
+            "blacklist_detected": False,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200
+
+    scored = warmup_client.post(
+        "/warmup/reputation/score",
+        json={
+            "tenant_id": tenant,
+            "mailbox": mailbox,
+            "inbox_rate": 0.88,
+            "spam_rate": 0.02,
+            "bounce_rate": 0.01,
+            "complaint_rate": 0.002,
+            "reply_rate": 0.2,
+            "blacklist_detected": False,
+        },
+    )
+    assert scored.status_code == 200
+
+    renew_route = next(
+        route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/worker/certification/renew"
+    )
+    warmup_state = renew_route.endpoint.__globals__
+    with warmup_state["Session"](warmup_state["engine"]) as session:
+        state = session.scalar(
+            warmup_state["select"](warmup_state["CertificationState"]).where(
+                warmup_state["CertificationState"].tenant_id == tenant,
+                warmup_state["CertificationState"].mailbox == mailbox.lower(),
+            )
+        )
+        assert state is not None
+        state.expires_at = warmup_state["utc_now"]() - warmup_state["timedelta"](days=1)
+        session.commit()
+
+    issued = auth_client.post(
+        "/service/token",
+        json={
+            "service_name": "billing-service",
+            "actions": ["admin"],
+            "resources": ["warmup"],
+            "bootstrap_token": "dev-service-bootstrap",
+        },
+    )
+    assert issued.status_code == 200
+    headers = gateway_signed_headers(issued.json()["access_token"], request_id=f"req-renew-{uuid.uuid4().hex[:8]}")
+
+    renewed = warmup_client.post(
+        "/warmup/worker/certification/renew",
+        headers=headers,
+        json={"limit": 50},
+    )
+    assert renewed.status_code == 200
+    assert renewed.json()["processed"] >= 1
+    assert any(item["tenant_id"] == tenant for item in renewed.json()["items"])
+
+
 def test_warmup_queue_retry_backoff_respects_ready_time():
     client = TestClient(warmup_app)
     route = next(route for route in warmup_app.router.routes if getattr(route, "path", "") == "/warmup/worker/process-next")
