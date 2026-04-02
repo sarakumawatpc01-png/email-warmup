@@ -883,7 +883,13 @@ def test_gateway_policy_consensus_requires_service_identity():
     assert denied.status_code == 403
     assert denied.json()["detail"] == "Forbidden"
 
-    allowed = gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"})
+    allowed = gateway_client.post(
+        "/policy/consensus",
+        headers={
+            "x-caller-service": "warmup",
+            "x-caller-identity": "spiffe://email-warmup/warmup-engine",
+        },
+    )
     assert allowed.status_code == 200
     assert allowed.json()["consensus_decision"] == "adopt"
 
@@ -892,7 +898,11 @@ def test_gateway_middleware_rejects_invalid_content_length():
     gateway_client = TestClient(gateway_app)
     invalid = gateway_client.post(
         "/policy/consensus",
-        headers={"x-caller-service": "warmup", "content-length": "not-a-number"},
+        headers={
+            "x-caller-service": "warmup",
+            "x-caller-identity": "spiffe://email-warmup/warmup-engine",
+            "content-length": "not-a-number",
+        },
     )
     assert invalid.status_code == 400
     assert invalid.json()["detail"] == "Invalid Content-Length"
@@ -918,10 +928,29 @@ def test_gateway_policy_rate_limit_applies():
     gateway_state["GATEWAY_ADMIN_RATE_WINDOW_SECONDS"] = 60
     gateway_state["_RATE_LIMIT_BUCKETS"].clear()
 
-    assert gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"}).status_code == 200
-    assert gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"}).status_code == 200
-    limited = gateway_client.post("/policy/consensus", headers={"x-caller-service": "warmup"})
+    headers = {
+        "x-caller-service": "warmup",
+        "x-caller-identity": "spiffe://email-warmup/warmup-engine",
+    }
+    assert gateway_client.post("/policy/consensus", headers=headers).status_code == 200
+    assert gateway_client.post("/policy/consensus", headers=headers).status_code == 200
+    limited = gateway_client.post("/policy/consensus", headers=headers)
     assert limited.status_code == 429
+
+
+def test_gateway_policy_consensus_rejects_mismatched_service_identity():
+    gateway_client = TestClient(gateway_app)
+    route = next(route for route in gateway_app.router.routes if getattr(route, "path", "") == "/policy/consensus")
+    gateway_state = route.endpoint.__globals__
+    gateway_state["_RATE_LIMIT_BUCKETS"].clear()
+    denied = gateway_client.post(
+        "/policy/consensus",
+        headers={
+            "x-caller-service": "warmup",
+            "x-caller-identity": "spiffe://email-warmup/auth",
+        },
+    )
+    assert denied.status_code == 403
 
 
 def test_auth_rate_limit_signup_applies():
