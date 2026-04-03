@@ -16,7 +16,6 @@ This repository now uses the supplement-style monorepo naming from the uploaded 
 - `frontend/`
   - `client`
   - `superadmin`
-- `nginx/` → reverse proxy and secure headers
 - `onboarding-scripts/`
   - `provision_client.sh`
   - `deprovision_client.sh`
@@ -26,11 +25,20 @@ This repository now uses the supplement-style monorepo naming from the uploaded 
 
 Copy `.env.example` to `.env` and update values.
 
-## Run Locally
+## Run with Docker Compose
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
+
+## Traefik Routing (production)
+
+- Domain: `https://email-warmup.agencyfic.com`
+- `/` → client UI (`frontend-client`)
+- `/admin/` → superadmin UI (`frontend-admin`)
+- `/api/*` → backend gateway (`backend`)
+
+`docker-compose.yml` expects an external Docker network named `proxy` for Traefik integration.
 
 ## Core Endpoints (via backend gateway)
 
