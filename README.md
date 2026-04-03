@@ -32,6 +32,43 @@ Copy `.env.example` to `.env` and update values.
 docker compose up --build
 ```
 
+## Access URLs
+
+- Client UI dashboard: `http://localhost/`
+- Superadmin control plane: `http://localhost/admin/`
+- API gateway base (through nginx): `http://localhost/api/`
+
+## First-Time Login / Signup
+
+### Superadmin bootstrap
+
+1. Open `http://localhost/admin/`
+2. Use **Signup Superadmin** to create your first superadmin account:
+   - email
+   - password (min 8 chars)
+   - tenant_id (use `system` for initial setup)
+3. After signup you are logged in automatically and can access:
+   - Internal Network IDs
+   - Client Mailboxes
+   - Health & Analytics
+   - Payment Gateway Setup
+   - Billing Admin
+   - Audit Logs
+
+### Client account
+
+1. Open `http://localhost/`
+2. Use **Signup** to create a client account:
+   - email
+   - password (min 8 chars)
+   - tenant_id
+3. After signup you are logged in automatically and can use dashboard quick actions.
+
+### Existing users
+
+- Use **Login** on either UI with your existing credentials.
+- Use **Logout** in the top-right to clear local session.
+
 ## Core Endpoints (via backend gateway)
 
 - `POST /auth/signup`
@@ -45,6 +82,11 @@ docker compose up --build
 - `POST /ai/run`
 - `POST /billing/subscriptions/preview`
 - `POST /whatsapp/messages`
+
+## Notes
+
+- Frontend requests are routed through nginx as `/api/*`.
+- Auth users are currently in-memory in auth service, so accounts are not persistent across auth service restarts yet.
 
 ## Tests
 
