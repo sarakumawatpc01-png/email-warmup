@@ -1,6 +1,11 @@
 # email-warmup
 
-This repository now uses the supplement-style monorepo naming from the uploaded docs (`MasterBuildPlan_v2_Complete.docx` and `EmailSaaS_Supplement_v1.docx`) while preserving current functionality.
+This repository uses the supplement-style monorepo naming from:
+
+- `MasterBuildPlan_v2_Complete.docx`
+- `EmailSaaS_Supplement_v1.docx`
+
+while preserving current functionality.
 
 ## Structure (aligned)
 
@@ -40,9 +45,15 @@ Copy `.env.example` to `.env` and update values.
 docker compose up --build -d
 ```
 
+## Access URLs
+
+- Client UI dashboard: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/`
+- Superadmin control plane: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/admin/`
+- API gateway compatibility path: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/api/`
+
 ## Traefik Routing (production)
 
-- Domain: `https://email-warmup.agencyfic.com`
+- Domain: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}`
 - `/` → client UI (`frontend-client`)
 - `/admin/` → superadmin UI (`frontend-admin`)
 - `/api/*` → backend gateway (`backend`)
@@ -60,6 +71,37 @@ The public-facing client service uses these required labels:
 - `traefik.http.routers.email-warmup.entrypoints=websecure`
 - `traefik.http.routers.email-warmup.tls.certresolver=letsencrypt`
 - `traefik.http.services.email-warmup.loadbalancer.server.port=80`
+
+## First-Time Login / Signup
+
+### Superadmin bootstrap
+
+1. Open the superadmin URL.
+2. Use **Signup Superadmin** to create your first superadmin account:
+   - email
+   - password (min 8 chars)
+   - tenant_id (use `system` for initial setup)
+3. After signup you are logged in automatically and can access:
+   - Internal Network IDs
+   - Client Mailboxes
+   - Health & Analytics
+   - Payment Gateway Setup
+   - Billing Admin
+   - Audit Logs
+
+### Client account
+
+1. Open the client URL.
+2. Use **Signup** to create a client account:
+   - email
+   - password (min 8 chars)
+   - tenant_id
+3. After signup you are logged in automatically and can use dashboard quick actions.
+
+### Existing users
+
+- Use **Login** on either UI with your existing credentials.
+- Use **Logout** in the top-right to clear local session.
 
 ## Production go-live (Traefik server)
 
@@ -90,9 +132,9 @@ The public-facing client service uses these required labels:
      ```
 
 4. **Validate public routes**
-   - `https://email-warmup.agencyfic.com/` → client UI
-   - `https://email-warmup.agencyfic.com/admin/` → superadmin UI
-   - `https://email-warmup.agencyfic.com/health` (or `/api/health`) → backend health path
+   - `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/` → client UI
+   - `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/admin/` → superadmin UI
+   - `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/health` (or `/api/health`) → backend health path
 
 5. **Post-deploy checks**
    - Confirm DNS A record points domain to server IP.
@@ -113,6 +155,11 @@ The public-facing client service uses these required labels:
 - `POST /ai/run`
 - `POST /billing/subscriptions/preview`
 - `POST /whatsapp/messages`
+
+## Notes
+
+- Frontend requests are routed through Traefik to backend gateway (`/api/*` compatibility path supported).
+- Auth users are currently in-memory in auth service, so accounts are not persistent across auth service restarts yet.
 
 ## Tests
 
