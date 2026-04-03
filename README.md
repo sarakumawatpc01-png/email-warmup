@@ -21,7 +21,6 @@ while preserving current functionality.
 - `frontend/`
   - `client`
   - `superadmin`
-- `nginx/` (reverse proxy and secure headers)
 - `onboarding-scripts/`
   - `provision_client.sh`
   - `deprovision_client.sh`
@@ -31,6 +30,15 @@ while preserving current functionality.
 
 Copy `.env.example` to `.env` and update values.
 
+### Required production values
+
+- `TRAEFIK_HOST=email-warmup.agencyfic.com` (or your domain)
+- `ALLOWED_ORIGINS=https://email-warmup.agencyfic.com`
+- `POSTGRES_PASSWORD=<strong-secret>`
+- `JWT_SECRET=<strong-random-secret>`
+- `GRAFANA_ADMIN_PASSWORD=<strong-secret>`
+- `WARMUP_DATABASE_URL` must use the same DB password as `POSTGRES_PASSWORD`
+
 ## Run with Docker Compose
 
 ```bash
@@ -39,15 +47,36 @@ docker compose up --build -d
 
 ## Access URLs
 
-- Client UI dashboard: `http://localhost/`
-- Superadmin control plane: `http://localhost/admin/`
-- API gateway base (through nginx): `http://localhost/api/`
+- Client UI dashboard: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/`
+- Superadmin control plane: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/admin/`
+- API gateway compatibility path: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/api/`
+
+## Traefik Routing (production)
+
+- Domain: `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}`
+- `/` → client UI (`frontend-client`)
+- `/admin/` → superadmin UI (`frontend-admin`)
+- `/api/*` → backend gateway (`backend`)
+- direct API paths (`/auth`, `/leads`, `/verification`, `/warmup`, `/ai`, `/billing`, `/whatsapp`, `/policy`, `/health`) → backend gateway (`backend`)
+
+`docker-compose.yml` expects an external Docker network named `proxy` for Traefik integration.
+Ports `80` and `443` must be owned by Traefik only; this stack does not publish host ports for app containers.
+
+### Required public service labels (frontend client)
+
+The public-facing client service uses these required labels:
+
+- `traefik.enable=true`
+- `traefik.http.routers.email-warmup.rule=Host(\`${TRAEFIK_HOST:-email-warmup.agencyfic.com}\`)`
+- `traefik.http.routers.email-warmup.entrypoints=websecure`
+- `traefik.http.routers.email-warmup.tls.certresolver=letsencrypt`
+- `traefik.http.services.email-warmup.loadbalancer.server.port=80`
 
 ## First-Time Login / Signup
 
 ### Superadmin bootstrap
 
-1. Open `http://localhost/admin/`
+1. Open the superadmin URL.
 2. Use **Signup Superadmin** to create your first superadmin account:
    - email
    - password (min 8 chars)
@@ -62,7 +91,7 @@ docker compose up --build -d
 
 ### Client account
 
-1. Open `http://localhost/`
+1. Open the client URL.
 2. Use **Signup** to create a client account:
    - email
    - password (min 8 chars)
@@ -73,6 +102,45 @@ docker compose up --build -d
 
 - Use **Login** on either UI with your existing credentials.
 - Use **Logout** in the top-right to clear local session.
+
+## Production go-live (Traefik server)
+
+1. **Prepare server**
+   - Install Docker + Docker Compose plugin.
+   - Ensure Traefik is already running on the server with `websecure` and Let’s Encrypt enabled.
+   - Ensure external Docker network exists:
+     ```bash
+     docker network create proxy || true
+     ```
+
+2. **Deploy app**
+   - Create `.env` from `.env.example` and set secure production values.
+   - Start stack:
+     ```bash
+     docker compose pull
+     docker compose up -d --build
+     ```
+
+3. **Validate runtime**
+   - Check service state:
+     ```bash
+     docker compose ps
+     ```
+   - Check logs for any failed service:
+     ```bash
+     docker compose logs --tail=200 <service_name>
+     ```
+
+4. **Validate public routes**
+   - `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/` → client UI
+   - `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/admin/` → superadmin UI
+   - `https://${TRAEFIK_HOST:-email-warmup.agencyfic.com}/health` (or `/api/health`) → backend health path
+
+5. **Post-deploy checks**
+   - Confirm DNS A record points domain to server IP.
+   - Confirm Traefik issued TLS certificate.
+   - Confirm internal services are not publicly exposed by host ports.
+   - Confirm external `proxy` network exists and Traefik sees `email-warmup`, `email-warmup-admin`, and API routers.
 
 ## Core Endpoints (via backend gateway)
 
@@ -90,7 +158,7 @@ docker compose up --build -d
 
 ## Notes
 
-- Frontend requests are routed through nginx as `/api/*`.
+- Frontend requests are routed through Traefik to backend gateway (`/api/*` compatibility path supported).
 - Auth users are currently in-memory in auth service, so accounts are not persistent across auth service restarts yet.
 
 ## Tests

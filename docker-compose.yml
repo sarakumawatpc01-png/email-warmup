@@ -5,8 +5,6 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-email_saas}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-email_saas}
       POSTGRES_DB: ${POSTGRES_DB:-email_saas}
-    ports:
-      - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     networks:
@@ -14,8 +12,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     networks:
       - app-net
 
@@ -25,8 +21,6 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-secret}
       JWT_ALGORITHM: HS256
       ACCESS_TOKEN_EXPIRE_MINUTES: 60
-    ports:
-      - "8001:8001"
     networks:
       - app-net
 
@@ -37,8 +31,6 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev-secret}
     depends_on:
       - postgres
-    ports:
-      - "8002:8002"
     networks:
       - app-net
 
@@ -56,8 +48,6 @@ services:
     depends_on:
       - postgres
       - redis
-    ports:
-      - "8003:8003"
     networks:
       - app-net
 
@@ -119,15 +109,11 @@ services:
 
   verification_engine:
     build: ./verification-engine
-    ports:
-      - "8004:8004"
     networks:
       - app-net
 
   ai_agent:
     build: ./ai-agent
-    ports:
-      - "8005:8005"
     networks:
       - app-net
 
@@ -150,10 +136,24 @@ services:
       - warmup_engine
       - verification_engine
       - ai_agent
-    ports:
-      - "8000:8000"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.email-warmup-api.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`) && (PathPrefix(`/auth`) || PathPrefix(`/leads`) || PathPrefix(`/verification`) || PathPrefix(`/warmup`) || PathPrefix(`/ai`) || PathPrefix(`/billing`) || PathPrefix(`/whatsapp`) || PathPrefix(`/policy`) || PathPrefix(`/health`))
+      - traefik.http.routers.email-warmup-api.entrypoints=websecure
+      - traefik.http.routers.email-warmup-api.tls.certresolver=letsencrypt
+      - traefik.http.routers.email-warmup-api.priority=200
+      - traefik.http.services.email-warmup-api.loadbalancer.server.port=8000
+      - traefik.http.routers.email-warmup-api-compat.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`) && PathPrefix(`/api`)
+      - traefik.http.routers.email-warmup-api-compat.entrypoints=websecure
+      - traefik.http.routers.email-warmup-api-compat.tls.certresolver=letsencrypt
+      - traefik.http.routers.email-warmup-api-compat.priority=210
+      - traefik.http.routers.email-warmup-api-compat.middlewares=email-warmup-api-strip
+      - traefik.http.middlewares.email-warmup-api-strip.stripprefix.prefixes=/api
+      - traefik.http.routers.email-warmup-api-compat.service=email-warmup-api
     networks:
       - app-net
+      - proxy
 
   billing_service:
     build: ./billing-service
@@ -185,8 +185,6 @@ services:
       PAYTM_WEBHOOK_SECRET: ${PAYTM_WEBHOOK_SECRET:-}
       JWT_SECRET: ${JWT_SECRET:-dev-secret}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
-    ports:
-      - "3001:3001"
     networks:
       - app-net
 
@@ -195,9 +193,6 @@ services:
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
       - ./ops/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
-    ports:
-      - "4318:4318"
-      - "4317:4317"
     networks:
       - app-net
 
@@ -209,8 +204,6 @@ services:
     volumes:
       - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./ops/alerts:/etc/prometheus/alerts:ro
-    ports:
-      - "9090:9090"
     networks:
       - app-net
 
@@ -219,8 +212,6 @@ services:
     command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
     volumes:
       - ./ops/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
-    ports:
-      - "9093:9093"
     networks:
       - app-net
 
@@ -234,58 +225,53 @@ services:
       - ./ops/grafana-dashboard-warmup.json:/var/lib/grafana/dashboards/warmup.json:ro
       - ./ops/grafana-provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./ops/grafana-provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-    ports:
-      - "3003:3000"
     networks:
       - app-net
 
   whatsapp_service:
     build: ./backend/services/whatsapp-service
-    ports:
-      - "3002:3002"
     networks:
       - app-net
 
   crm:
     image: nginx:alpine
     command: ["/bin/sh", "-c", "echo '<h1>Twenty CRM Integration Stub</h1>' > /usr/share/nginx/html/index.html && nginx -g 'daemon off;'"]
-    ports:
-      - "8070:80"
     networks:
       - app-net
 
   mautic-client-template:
     image: php:8.2-apache
     command: ["/bin/sh", "-c", "echo '<?php echo \"Mautic client template\"; ?>' > /var/www/html/index.php && apache2-foreground"]
-    ports:
-      - "8081:80"
     networks:
       - app-net
 
   frontend-client:
     build: ./frontend/client
-    ports:
-      - "5173:80"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.email-warmup.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`)
+      - traefik.http.routers.email-warmup.entrypoints=websecure
+      - traefik.http.routers.email-warmup.tls.certresolver=letsencrypt
+      - traefik.http.routers.email-warmup.priority=10
+      - traefik.http.services.email-warmup.loadbalancer.server.port=80
     networks:
-      - app-net
+      - proxy
 
   frontend-admin:
     build: ./frontend/superadmin
-    ports:
-      - "5174:80"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.email-warmup-admin.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`) && PathPrefix(`/admin`)
+      - traefik.http.routers.email-warmup-admin.entrypoints=websecure
+      - traefik.http.routers.email-warmup-admin.tls.certresolver=letsencrypt
+      - traefik.http.routers.email-warmup-admin.priority=100
+      - traefik.http.routers.email-warmup-admin.middlewares=email-warmup-admin-strip
+      - traefik.http.middlewares.email-warmup-admin-strip.stripprefix.prefixes=/admin
+      - traefik.http.services.email-warmup-admin.loadbalancer.server.port=80
     networks:
-      - app-net
-
-  nginx:
-    build: ./nginx
-    depends_on:
-      - backend
-      - frontend-client
-      - frontend-admin
-    ports:
-      - "80:80"
-    networks:
-      - app-net
+      - proxy
 
 volumes:
   pg_data:
@@ -294,3 +280,5 @@ volumes:
 networks:
   app-net:
     driver: bridge
+  proxy:
+    external: true
