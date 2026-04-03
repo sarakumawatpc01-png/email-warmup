@@ -264,67 +264,79 @@ const html = `<!doctype html>
         q(targetId).textContent = JSON.stringify(data.payload, null, 2);
       }
 
-      q('superadmin-login').onclick = () => withLoading(q('superadmin-login'), async () => {
-        const { email, password } = parseAuthForm();
-        const res = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password })
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(data.detail || data.error || 'Login failed');
+      q('superadmin-login').onclick = async () => {
+        try {
+          await withLoading(q('superadmin-login'), async () => {
+            const { email, password } = parseAuthForm();
+            const res = await fetch('/api/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              throw new Error(data.detail || data.error || 'Login failed');
+            }
+            const verify = await fetch('/api/auth/verify-token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: data.access_token })
+            });
+            const profile = await verify.json().catch(() => ({}));
+            if (!verify.ok) {
+              throw new Error(profile.detail || 'Token verification failed');
+            }
+            if (profile.role !== 'superadmin') {
+              throw new Error('This dashboard requires a superadmin account.');
+            }
+            setSignedIn(data.access_token, profile);
+            banner('Logged in successfully.');
+            await Promise.resolve()
+              .then(() => loadInternal())
+              .then(() => loadDlqAndAudit())
+              .then(() => loadPayments());
+          });
+        } catch (error) {
+          banner(error.message || 'Login failed', 'error');
         }
-        const verify = await fetch('/api/auth/verify-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: data.access_token })
-        });
-        const profile = await verify.json().catch(() => ({}));
-        if (!verify.ok) {
-          throw new Error(profile.detail || 'Token verification failed');
-        }
-        if (profile.role !== 'superadmin') {
-          throw new Error('This dashboard requires a superadmin account.');
-        }
-        setSignedIn(data.access_token, profile);
-        banner('Logged in successfully.');
-        await Promise.resolve()
-          .then(() => loadInternal())
-          .then(() => loadDlqAndAudit())
-          .then(() => loadPayments());
-      }).catch((error) => banner(error.message || 'Login failed', 'error'));
+      };
 
-      q('superadmin-signup').onclick = () => withLoading(q('superadmin-signup'), async () => {
-        const { email, password, tenantId } = parseAuthForm();
-        if (!validateTenant(tenantId)) {
-          throw new Error('tenant_id must be at least 2 characters for signup.');
+      q('superadmin-signup').onclick = async () => {
+        try {
+          await withLoading(q('superadmin-signup'), async () => {
+            const { email, password, tenantId } = parseAuthForm();
+            if (!validateTenant(tenantId)) {
+              throw new Error('tenant_id must be at least 2 characters for signup.');
+            }
+            const res = await fetch('/api/auth/signup', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password, role: 'superadmin', tenant_id: tenantId })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              throw new Error(data.detail || data.error || 'Signup failed');
+            }
+            const verify = await fetch('/api/auth/verify-token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: data.access_token })
+            });
+            const profile = await verify.json().catch(() => ({}));
+            if (!verify.ok) {
+              throw new Error(profile.detail || 'Token verification failed');
+            }
+            setSignedIn(data.access_token, profile);
+            banner('Superadmin bootstrap complete.');
+            await Promise.resolve()
+              .then(() => loadInternal())
+              .then(() => loadDlqAndAudit())
+              .then(() => loadPayments());
+          });
+        } catch (error) {
+          banner(error.message || 'Signup failed', 'error');
         }
-        const res = await fetch('/api/auth/signup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password, role: 'superadmin', tenant_id: tenantId })
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(data.detail || data.error || 'Signup failed');
-        }
-        const verify = await fetch('/api/auth/verify-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: data.access_token })
-        });
-        const profile = await verify.json().catch(() => ({}));
-        if (!verify.ok) {
-          throw new Error(profile.detail || 'Token verification failed');
-        }
-        setSignedIn(data.access_token, profile);
-        banner('Superadmin bootstrap complete.');
-        await Promise.resolve()
-          .then(() => loadInternal())
-          .then(() => loadDlqAndAudit())
-          .then(() => loadPayments());
-      }).catch((error) => banner(error.message || 'Signup failed', 'error'));
+      };
 
       q('superadmin-logout').onclick = () => {
         setSignedOut();

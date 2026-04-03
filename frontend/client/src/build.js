@@ -126,56 +126,68 @@ const html = `<!doctype html>
         return { email, password, tenantId };
       };
 
-      q('client-login').onclick = () => withLoading(q('client-login'), async () => {
-        const { email, password } = parseAuthForm();
-        const res = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password })
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(data.detail || data.error || 'Login failed');
+      q('client-login').onclick = async () => {
+        try {
+          await withLoading(q('client-login'), async () => {
+            const { email, password } = parseAuthForm();
+            const res = await fetch('/api/auth/login', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              throw new Error(data.detail || data.error || 'Login failed');
+            }
+            const verify = await fetch('/api/auth/verify-token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: data.access_token })
+            });
+            const profile = await verify.json().catch(() => ({}));
+            if (!verify.ok) {
+              throw new Error(profile.detail || 'Token verification failed');
+            }
+            setSignedIn(data.access_token, profile);
+            banner('Logged in successfully.');
+          });
+        } catch (error) {
+          banner(error.message || 'Login failed', 'error');
         }
-        const verify = await fetch('/api/auth/verify-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: data.access_token })
-        });
-        const profile = await verify.json().catch(() => ({}));
-        if (!verify.ok) {
-          throw new Error(profile.detail || 'Token verification failed');
-        }
-        setSignedIn(data.access_token, profile);
-        banner('Logged in successfully.');
-      }).catch((error) => banner(error.message || 'Login failed', 'error'));
+      };
 
-      q('client-signup').onclick = () => withLoading(q('client-signup'), async () => {
-        const { email, password, tenantId } = parseAuthForm();
-        if (!tenantId || tenantId.length < 2) {
-          throw new Error('tenant_id must be at least 2 characters for signup.');
+      q('client-signup').onclick = async () => {
+        try {
+          await withLoading(q('client-signup'), async () => {
+            const { email, password, tenantId } = parseAuthForm();
+            if (!tenantId || tenantId.length < 2) {
+              throw new Error('tenant_id must be at least 2 characters for signup.');
+            }
+            const res = await fetch('/api/auth/signup', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password, role: 'client', tenant_id: tenantId })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+              throw new Error(data.detail || data.error || 'Signup failed');
+            }
+            const verify = await fetch('/api/auth/verify-token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: data.access_token })
+            });
+            const profile = await verify.json().catch(() => ({}));
+            if (!verify.ok) {
+              throw new Error(profile.detail || 'Token verification failed');
+            }
+            setSignedIn(data.access_token, profile);
+            banner('Signup complete. You are now logged in.');
+          });
+        } catch (error) {
+          banner(error.message || 'Signup failed', 'error');
         }
-        const res = await fetch('/api/auth/signup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, password, role: 'client', tenant_id: tenantId })
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(data.detail || data.error || 'Signup failed');
-        }
-        const verify = await fetch('/api/auth/verify-token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: data.access_token })
-        });
-        const profile = await verify.json().catch(() => ({}));
-        if (!verify.ok) {
-          throw new Error(profile.detail || 'Token verification failed');
-        }
-        setSignedIn(data.access_token, profile);
-        banner('Signup complete. You are now logged in.');
-      }).catch((error) => banner(error.message || 'Signup failed', 'error'));
+      };
 
       q('client-logout').onclick = () => {
         setSignedOut();
