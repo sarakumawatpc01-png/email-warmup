@@ -139,13 +139,18 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=proxy
-      - traefik.http.routers.email-warmup-api.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`) && PathPrefix(`/api`)
+      - traefik.http.routers.email-warmup-api.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`) && (PathPrefix(`/auth`) || PathPrefix(`/leads`) || PathPrefix(`/verification`) || PathPrefix(`/warmup`) || PathPrefix(`/ai`) || PathPrefix(`/billing`) || PathPrefix(`/whatsapp`) || PathPrefix(`/policy`) || PathPrefix(`/health`))
       - traefik.http.routers.email-warmup-api.entrypoints=websecure
       - traefik.http.routers.email-warmup-api.tls.certresolver=letsencrypt
       - traefik.http.routers.email-warmup-api.priority=200
-      - traefik.http.routers.email-warmup-api.middlewares=email-warmup-api-strip
-      - traefik.http.middlewares.email-warmup-api-strip.stripprefix.prefixes=/api
       - traefik.http.services.email-warmup-api.loadbalancer.server.port=8000
+      - traefik.http.routers.email-warmup-api-compat.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`) && PathPrefix(`/api`)
+      - traefik.http.routers.email-warmup-api-compat.entrypoints=websecure
+      - traefik.http.routers.email-warmup-api-compat.tls.certresolver=letsencrypt
+      - traefik.http.routers.email-warmup-api-compat.priority=210
+      - traefik.http.routers.email-warmup-api-compat.middlewares=email-warmup-api-strip
+      - traefik.http.middlewares.email-warmup-api-strip.stripprefix.prefixes=/api
+      - traefik.http.routers.email-warmup-api-compat.service=email-warmup-api
     networks:
       - app-net
       - proxy
