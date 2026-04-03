@@ -25,6 +25,15 @@ This repository now uses the supplement-style monorepo naming from the uploaded 
 
 Copy `.env.example` to `.env` and update values.
 
+### Required production values
+
+- `TRAEFIK_HOST=email-warmup.agencyfic.com` (or your domain)
+- `ALLOWED_ORIGINS=https://email-warmup.agencyfic.com`
+- `POSTGRES_PASSWORD=<strong-secret>`
+- `JWT_SECRET=<strong-random-secret>`
+- `GRAFANA_ADMIN_PASSWORD=<strong-secret>`
+- `WARMUP_DATABASE_URL` must use the same DB password as `POSTGRES_PASSWORD`
+
 ## Run with Docker Compose
 
 ```bash
@@ -39,6 +48,44 @@ docker compose up --build -d
 - `/api/*` → backend gateway (`backend`)
 
 `docker-compose.yml` expects an external Docker network named `proxy` for Traefik integration.
+
+## Production go-live (Traefik server)
+
+1. **Prepare server**
+   - Install Docker + Docker Compose plugin.
+   - Ensure Traefik is already running on the server with `websecure` and Let’s Encrypt enabled.
+   - Ensure external Docker network exists:
+     ```bash
+     docker network create proxy || true
+     ```
+
+2. **Deploy app**
+   - Create `.env` from `.env.example` and set secure production values.
+   - Start stack:
+     ```bash
+     docker compose pull
+     docker compose up -d --build
+     ```
+
+3. **Validate runtime**
+   - Check service state:
+     ```bash
+     docker compose ps
+     ```
+   - Check logs for any failed service:
+     ```bash
+     docker compose logs --tail=200 <service_name>
+     ```
+
+4. **Validate public routes**
+   - `https://email-warmup.agencyfic.com/` → client UI
+   - `https://email-warmup.agencyfic.com/admin/` → superadmin UI
+   - `https://email-warmup.agencyfic.com/health` (or `/api/health`) → backend health path
+
+5. **Post-deploy checks**
+   - Confirm DNS A record points domain to server IP.
+   - Confirm Traefik issued TLS certificate.
+   - Confirm internal services are not publicly exposed by host ports.
 
 ## Core Endpoints (via backend gateway)
 
