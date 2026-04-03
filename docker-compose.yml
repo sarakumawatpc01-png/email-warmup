@@ -250,7 +250,7 @@ services:
     labels:
       - traefik.enable=true
       - traefik.docker.network=proxy
-      - traefik.http.routers.email-warmup.rule=Host(`email-warmup.agencyfic.com`) && PathPrefix(`/`)
+      - traefik.http.routers.email-warmup.rule=Host(`${TRAEFIK_HOST:-email-warmup.agencyfic.com}`)
       - traefik.http.routers.email-warmup.entrypoints=websecure
       - traefik.http.routers.email-warmup.tls.certresolver=letsencrypt
       - traefik.http.routers.email-warmup.priority=10

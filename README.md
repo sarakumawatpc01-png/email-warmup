@@ -56,7 +56,7 @@ Ports `80` and `443` must be owned by Traefik only; this stack does not publish 
 The public-facing client service uses these required labels:
 
 - `traefik.enable=true`
-- `traefik.http.routers.email-warmup.rule=Host(\`email-warmup.agencyfic.com\`)`
+- `traefik.http.routers.email-warmup.rule=Host(\`${TRAEFIK_HOST:-email-warmup.agencyfic.com}\`)`
 - `traefik.http.routers.email-warmup.entrypoints=websecure`
 - `traefik.http.routers.email-warmup.tls.certresolver=letsencrypt`
 - `traefik.http.services.email-warmup.loadbalancer.server.port=80`
