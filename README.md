@@ -46,8 +46,20 @@ docker compose up --build -d
 - `/` → client UI (`frontend-client`)
 - `/admin/` → superadmin UI (`frontend-admin`)
 - `/api/*` → backend gateway (`backend`)
+- direct API paths (`/auth`, `/leads`, `/verification`, `/warmup`, `/ai`, `/billing`, `/whatsapp`, `/policy`, `/health`) → backend gateway (`backend`)
 
 `docker-compose.yml` expects an external Docker network named `proxy` for Traefik integration.
+Ports `80` and `443` must be owned by Traefik only; this stack does not publish host ports for app containers.
+
+### Required public service labels (frontend client)
+
+The public-facing client service uses these required labels:
+
+- `traefik.enable=true`
+- `traefik.http.routers.email-warmup.rule=Host(\`email-warmup.agencyfic.com\`)`
+- `traefik.http.routers.email-warmup.entrypoints=websecure`
+- `traefik.http.routers.email-warmup.tls.certresolver=letsencrypt`
+- `traefik.http.services.email-warmup.loadbalancer.server.port=80`
 
 ## Production go-live (Traefik server)
 
@@ -86,6 +98,7 @@ docker compose up --build -d
    - Confirm DNS A record points domain to server IP.
    - Confirm Traefik issued TLS certificate.
    - Confirm internal services are not publicly exposed by host ports.
+   - Confirm external `proxy` network exists and Traefik sees `email-warmup`, `email-warmup-admin`, and API routers.
 
 ## Core Endpoints (via backend gateway)
 
