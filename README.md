@@ -1,6 +1,11 @@
 # email-warmup
 
-This repository now uses the supplement-style monorepo naming from the uploaded docs (`MasterBuildPlan_v2_Complete.docx` and `EmailSaaS_Supplement_v1.docx`) while preserving current functionality.
+This repository uses the supplement-style monorepo naming from:
+
+- `MasterBuildPlan_v2_Complete.docx`
+- `EmailSaaS_Supplement_v1.docx`
+
+while preserving current functionality.
 
 ## Structure (aligned)
 
@@ -16,7 +21,7 @@ This repository now uses the supplement-style monorepo naming from the uploaded 
 - `frontend/`
   - `client`
   - `superadmin`
-- `nginx/` → reverse proxy and secure headers
+- `nginx/` (reverse proxy and secure headers)
 - `onboarding-scripts/`
   - `provision_client.sh`
   - `deprovision_client.sh`
@@ -26,10 +31,10 @@ This repository now uses the supplement-style monorepo naming from the uploaded 
 
 Copy `.env.example` to `.env` and update values.
 
-## Run Locally
+## Run with Docker Compose
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
 ## Access URLs
